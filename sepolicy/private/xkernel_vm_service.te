@@ -1,0 +1,29 @@
+# The x-kernel VM control service (/system_ext/bin/xkernel_vm_service).
+type xkernel_vm_service, domain, coredomain;
+type xkernel_vm_service_exec, system_file_type, exec_type, file_type;
+init_daemon_domain(xkernel_vm_service)
+
+# The service's Binder interface, used by the control app and the shell client.
+type xkernel_vm_control_service, service_manager_type;
+binder_use(xkernel_vm_service)
+add_service(xkernel_vm_service, xkernel_vm_control_service)
+binder_call(xkernel_vm_service, platform_app)
+allow platform_app xkernel_vm_control_service:service_manager find;
+binder_call(platform_app, xkernel_vm_service)
+
+# Callers other than root and system are checked against the control permission.
+allow xkernel_vm_service permission_service:service_manager find;
+binder_call(xkernel_vm_service, system_server)
+
+# A client of AVF: spawns its own virtmgr and passes it the VM images.
+virtualizationservice_use(xkernel_vm_service)
+get_prop(xkernel_vm_service, hypervisor_prop)
+
+# Instance ID, writable disk and the record of the running instance.
+type xkernel_vm_data_file, file_type, data_file_type, core_data_file_type;
+allow xkernel_vm_service xkernel_vm_data_file:dir create_dir_perms;
+allow xkernel_vm_service xkernel_vm_data_file:file create_file_perms;
+
+# The reclaim check reads /proc/<pid>/{cmdline,stat} of the VM's crosvm.
+r_dir_file(xkernel_vm_service, crosvm)
+r_dir_file(xkernel_vm_service, virtualizationmanager)

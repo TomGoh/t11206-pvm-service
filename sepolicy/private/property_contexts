@@ -1,0 +1,2 @@
+# Written by the hypervisor's boot words, read by virtmgr and this service.
+ro.boot.hypervisor.protected_vm_without_firmware.supported  u:object_r:hypervisor_prop:s0 exact bool

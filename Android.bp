@@ -1,0 +1,106 @@
+// Copyright 2026 KylinSoft Co., Ltd.
+// SPDX-License-Identifier: Apache-2.0
+//
+// The x-kernel VM control service: the only owner of the x-kernel VM, created through AVF as a
+// protected VM without guest firmware, controlled by clients over IXKernelVmControl.
+
+package {
+    default_applicable_licenses: ["Android-Apache-2.0"],
+}
+
+aidl_interface {
+    name: "com.kylinos.xkernelvm",
+    srcs: ["aidl/com/kylinos/xkernelvm/*.aidl"],
+    local_include_dir: "aidl",
+    // Used only between this service, its shell client and the control app, all built from the
+    // same tree and installed in system_ext together.
+    unstable: true,
+    system_ext_specific: true,
+    backend: {
+        cpp: {
+            enabled: false,
+        },
+        ndk: {
+            enabled: false,
+        },
+        java: {
+            enabled: true,
+            platform_apis: true,
+        },
+        rust: {
+            enabled: true,
+        },
+    },
+}
+
+rust_defaults {
+    name: "xkernel_vm_service_defaults",
+    crate_name: "xkernel_vm_service",
+    srcs: ["src/main.rs"],
+    edition: "2021",
+    prefer_rlib: true,
+    rustlibs: [
+        "android.os.permissions_aidl-rust",
+        "android.system.virtualizationservice-rust",
+        "com.kylinos.xkernelvm-rust",
+        "libandroid_logger",
+        "libanyhow",
+        "libbinder_rs",
+        "libclap",
+        "liblog_rust",
+        "libnix",
+        "librustutils",
+        "libserde",
+        "libserde_json",
+        "libvmclient",
+    ],
+}
+
+rust_binary {
+    name: "xkernel_vm_service",
+    defaults: ["xkernel_vm_service_defaults"],
+    system_ext_specific: true,
+    init_rc: ["etc/init/xkernel_vm_service.rc"],
+    required: [
+        "xkernel_vm.json",
+        "protected_vms_without_firmware_xkernel.xml",
+    ],
+}
+
+rust_test {
+    name: "xkernel_vm_service_test",
+    defaults: ["xkernel_vm_service_defaults"],
+    test_suites: ["general-tests"],
+}
+
+rust_binary {
+    name: "xkernel_vmctl",
+    crate_name: "xkernel_vmctl",
+    srcs: ["ctl/main.rs"],
+    edition: "2021",
+    prefer_rlib: true,
+    system_ext_specific: true,
+    rustlibs: [
+        "com.kylinos.xkernelvm-rust",
+        "libanyhow",
+        "libbinder_rs",
+        "libclap",
+        "libnix",
+    ],
+}
+
+prebuilt_etc {
+    name: "xkernel_vm.json",
+    src: "etc/xkernel_vm.json",
+    system_ext_specific: true,
+    relative_install_path: "xkernel_vm",
+}
+
+// Read by virtmgr: the x-kernel VM may only be run by /system_ext/bin/xkernel_vm_service, as a
+// protected VM without guest firmware.
+prebuilt_etc {
+    name: "protected_vms_without_firmware_xkernel.xml",
+    src: "etc/avf/protected_vms_without_firmware_xkernel.xml",
+    system_ext_specific: true,
+    relative_install_path: "avf",
+}

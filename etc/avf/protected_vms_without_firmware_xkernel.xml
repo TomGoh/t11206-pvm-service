@@ -1,0 +1,12 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!--
+     Copyright 2026 KylinSoft Co., Ltd.
+     SPDX-License-Identifier: Apache-2.0
+
+     Installed as /system_ext/etc/avf/protected_vms_without_firmware_xkernel.xml. virtmgr runs
+     the protected VM named here without guest firmware, and only for the executable named here
+     (see android/virtmgr/src/protected_without_firmware.rs in the virtualization module).
+-->
+<protected_vms_without_firmware>
+    <vm name="xkernel_vm" path="/system_ext/bin/xkernel_vm_service"/>
+</protected_vms_without_firmware>
