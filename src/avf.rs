@@ -16,10 +16,12 @@
 //! A watcher thread waits for the VM's death. `vmclient` reports both AVF's death callback and the
 //! death of the manager itself through the same wait, so one hook covers every way the VM ends.
 //!
-//! Console and log output go to logcat through the manager (it reads them when no file is
-//! given), so their size is bounded by the log buffer.
+//! The serial console goes to this service's [`Console`] (crosvm gets the guest ends of its pipes;
+//! the console of an instance ends with its death). The guest's log device goes to logcat
+//! through the manager, which reads it when no file is given.
 
 use crate::config::VmConfig;
+use crate::console::Console;
 use crate::controller::{Backend, Instance};
 use crate::machine::Exit;
 use android_system_virtualizationservice::aidl::android::system::virtualizationservice::{
@@ -48,6 +50,7 @@ pub struct AvfBackend {
     config: VmConfig,
     instance_id: [u8; INSTANCE_ID_SIZE],
     manager: Mutex<Option<Manager>>,
+    console: Arc<Console>,
 }
 
 /// This service's virtualization manager and the connection to it.
@@ -61,9 +64,9 @@ pub struct AvfInstance {
 }
 
 impl AvfBackend {
-    pub fn new(config: VmConfig) -> Result<Self> {
+    pub fn new(config: VmConfig, console: Arc<Console>) -> Result<Self> {
         let instance_id = load_or_create_instance_id(&config.state_dir)?;
-        Ok(Self { config, instance_id, manager: Mutex::new(None) })
+        Ok(Self { config, instance_id, manager: Mutex::new(None), console })
     }
 
     /// The connection to the virtualization manager, spawning it on first use or after it died.
@@ -121,29 +124,44 @@ impl Backend for AvfBackend {
 
     fn create_and_start(
         &self,
+        generation: u64,
         on_death: Box<dyn FnOnce(Exit) + Send>,
     ) -> Result<AvfInstance, String> {
         let raw = self.raw_config().map_err(|e| format!("{e:#}"))?;
         let connection = self.connection()?;
+        let console =
+            self.console.begin(generation).map_err(|e| format!("can't open the console: {e}"))?;
+        // The guest ends go to the manager; this process keeps none of them.
         let vm = VmInstance::create(
             connection.as_ref(),
             &VirtualMachineConfig::RawConfig(raw),
-            /* console_out= */ None,
-            /* console_in= */ None,
+            Some(console.output),
+            Some(console.input),
             /* log= */ None,
             /* dump_dt= */ None,
         )
-        .map_err(|e| format!("createVm: {e}"))?;
-        let vm = Arc::new(vm);
-        vm.start(None).map_err(|e| format!("start: {e}"))?;
+        .map_err(|e| format!("createVm: {e}"));
+        let vm = match vm {
+            Ok(vm) => Arc::new(vm),
+            Err(e) => {
+                self.console.end(generation);
+                return Err(e);
+            }
+        };
+        if let Err(e) = vm.start(None) {
+            self.console.end(generation);
+            return Err(format!("start: {e}"));
+        }
         info!("started {} with CID {}", self.config.name, vm.cid());
 
         let watcher = vm.clone();
+        let console = self.console.clone();
         thread::Builder::new()
             .name("xkvm-death-watch".into())
             .spawn(move || {
                 let reason = watcher.wait_for_death();
                 info!("VM died: {reason:?}");
+                console.end(generation);
                 drop(watcher);
                 on_death(exit_of(reason));
             })

@@ -10,12 +10,13 @@ x-kernel 虚拟机的原生控制服务。它是这台设备上 x-kernel 虚拟�
 - “已停止”必须经过回收核实：实例的 crosvm 进程已结束退出（宿主驱动在进程关闭最后一个文件时释放虚拟机）。停止超时或有残留进程时进入“回收失败或状态待核实”，此时再次请求停止会重新核实。
 - 每个实例有代次编号，迟到的旧事件被忽略；每次可见变化序号加一，客户端据此丢弃过期快照。
 - 服务重启后先核实上一轮留下的进程（`state_dir/instance.json`，含启动标识），再接受启动。
+- 虚拟机的串口控制台由服务持有：服务保留最新实例最近 64 KiB 的输出，客户端挂接时先拿到这段历史，之后的输出按“实例号 + 字节偏移”推送，客户端据此去重、发现缺口并重新挂接。输入只发给运行中的实例；客户机不读输入时写入被拒绝为“忙”，不会阻塞。控制台等于客户机里的 shell，所以和启停要求同样的权限，服务也不把控制台内容写进日志。
 
 状态与含义见 `src/machine.rs` 开头的说明，接口见 `aidl/com/kylinos/xkernelvm/`。
 
 ## 与 AVF 的关系
 
-服务把实例配置写成 `VirtualMachineRawConfig`（`protectedVm=true`），经 `libvmclient` 每次启动拉起一个 virtmgr。virtmgr 是否以无固件模式启动由 AVF 决定：本仓库安装的 `/system_ext/etc/avf/protected_vms_without_firmware_xkernel.xml` 声明虚拟机 `xkernel_vm` 只能由 `/system_ext/bin/xkernel_vm_service` 运行，且虚拟化层要报告 `ro.boot.hypervisor.protected_vm_without_firmware.supported`。这需要 Virtualization 模块的配套改动（分支 `xhyper/protected-without-firmware`）。
+服务把实例配置写成 `VirtualMachineRawConfig`（`protectedVm=true`），经 `libvmclient` 在第一次启动时拉起一个 virtmgr，之后的启动都复用它（长期运行的客户端无法按次释放 virtmgr，见 `src/avf.rs` 开头）。默认配置是 2 个虚拟处理器、256 MiB 内存。virtmgr 是否以无固件模式启动由 AVF 决定：本仓库安装的 `/system_ext/etc/avf/protected_vms_without_firmware_xkernel.xml` 声明虚拟机 `xkernel_vm` 只能由 `/system_ext/bin/xkernel_vm_service` 运行，且虚拟化层要报告 `ro.boot.hypervisor.protected_vm_without_firmware.supported`。这需要 Virtualization 模块的配套改动（分支 `xhyper/protected-without-firmware`）。
 
 ## 组成
 
@@ -26,8 +27,9 @@ x-kernel 虚拟机的原生控制服务。它是这台设备上 x-kernel 虚拟�
 | `src/reclaim.rs` | 回收核实：按进程号加启动时间和进程名查残留。 |
 | `src/controller.rs` | 把状态机接到执行线程、定时器和就绪探测上。 |
 | `src/avf.rs` | AVF 后端（`libvmclient`）。 |
+| `src/console.rs` | 串口控制台：每个实例的输入输出管道、输出历史与推送。 |
 | `src/service.rs` | `IXKernelVmControl` 的 Binder 实现与调用方校验。 |
-| `ctl/main.rs` | 命令行客户端 `xkernel_vmctl status|start|stop|watch`。 |
+| `ctl/main.rs` | 命令行客户端 `xkernel_vmctl status|start|stop|watch|console`。 |
 | `etc/` | 实例配置、AVF 声明、init 脚本。 |
 | `sepolicy/` | system_ext 策略；`sepolicy/vendor/README.md` 说明设备节点的厂商侧标签。 |
 | `product.mk` | 产品集成片段。 |

@@ -1,5 +1,7 @@
 #[path = "../../src/config.rs"]
 pub mod config;
+#[path = "../../src/console.rs"]
+pub mod console;
 #[path = "../../src/controller.rs"]
 pub mod controller;
 #[path = "../../src/machine.rs"]

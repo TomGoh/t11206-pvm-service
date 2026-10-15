@@ -8,20 +8,27 @@
 //! xkernel_vmctl start [--wait SECONDS]   # waits for RUNNING_NOT_READY/READY or a failure
 //! xkernel_vmctl stop  [--wait SECONDS]   # waits for STOPPED/FAILED/RECLAIM_UNKNOWN
 //! xkernel_vmctl watch [--wait SECONDS]   # prints every change
+//! xkernel_vmctl console [--new-only] [--send TEXT [--raw]] [--follow SECONDS]
 //! ```
 //!
-//! The exit status is 0 when the awaited state is reached and 1 otherwise, so scripts can rely
-//! on it.
+//! `console` prints the serial console output the service kept (unless `--new-only`), then types
+//! TEXT into the guest (with a newline unless `--raw`), then prints new output for SECONDS.
+//!
+//! The exit status is 0 when the awaited state is reached (for `console`: the input was taken)
+//! and 1 otherwise, so scripts can rely on it.
 
 use anyhow::{bail, Context, Result};
 use binder::{BinderFeatures, Interface, ProcessState, Result as BinderResult, Strong};
 use clap::{Parser, Subcommand};
 use com_kylinos_xkernelvm::aidl::com::kylinos::xkernelvm::{
+    ConsoleOutput::ConsoleOutput,
     IXKernelVmCallback::{BnXKernelVmCallback, IXKernelVmCallback},
+    IXKernelVmConsoleCallback::{BnXKernelVmConsoleCallback, IXKernelVmConsoleCallback},
     IXKernelVmControl::IXKernelVmControl,
     VmState::VmState,
     VmStatus::VmStatus,
 };
+use std::io::Write;
 use std::sync::mpsc::{channel, Sender};
 use std::sync::Mutex;
 use std::time::{Duration, Instant};
@@ -49,6 +56,20 @@ enum Command {
         #[arg(long, default_value_t = 3600)]
         wait: u64,
     },
+    Console {
+        /// Skip the output kept from before.
+        #[arg(long)]
+        new_only: bool,
+        /// Text to type into the guest.
+        #[arg(long)]
+        send: Option<String>,
+        /// Do not add a newline to the text.
+        #[arg(long)]
+        raw: bool,
+        /// Seconds to print new output for.
+        #[arg(long, default_value_t = 0)]
+        follow: u64,
+    },
 }
 
 struct Callback(Mutex<Sender<VmStatus>>);
@@ -60,6 +81,80 @@ impl IXKernelVmCallback for Callback {
         let _ = self.0.lock().unwrap().send(status.clone());
         Ok(())
     }
+}
+
+struct ConsoleCallback(Mutex<Sender<ConsoleOutput>>);
+
+impl Interface for ConsoleCallback {}
+
+impl IXKernelVmConsoleCallback for ConsoleCallback {
+    fn onConsoleOutput(&self, output: &ConsoleOutput) -> BinderResult<()> {
+        let _ = self.0.lock().unwrap().send(output.clone());
+        Ok(())
+    }
+}
+
+/// Prints the console as `console` in the module documentation describes.
+fn console(
+    service: &Strong<dyn IXKernelVmControl>,
+    new_only: bool,
+    send: Option<String>,
+    raw: bool,
+    follow: Duration,
+) -> Result<bool> {
+    let (tx, rx) = channel();
+    let callback = BnXKernelVmConsoleCallback::new_binder(
+        ConsoleCallback(Mutex::new(tx)),
+        BinderFeatures::default(),
+    );
+    let history = service.attachConsole(&callback).context("attachConsole")?;
+    let mut out = std::io::stdout().lock();
+    if !new_only {
+        out.write_all(&history.data)?;
+    }
+    out.flush()?;
+    let mut instance = history.instance;
+    let mut end = history.offset + history.data.len() as i64;
+    let mut taken = true;
+    if let Some(text) = send {
+        let mut bytes = text.into_bytes();
+        if !raw {
+            bytes.push(b'\n');
+        }
+        if let Err(e) = service.writeConsole(&bytes) {
+            eprintln!("input not taken: {e}");
+            taken = false;
+        }
+    }
+    let deadline = Instant::now() + follow;
+    loop {
+        let left = deadline.saturating_duration_since(Instant::now());
+        if left.is_zero() {
+            break;
+        }
+        let Ok(piece) = rx.recv_timeout(left) else { break };
+        if piece.instance != instance {
+            if piece.offset != 0 {
+                continue;
+            }
+            instance = piece.instance;
+            end = 0;
+            writeln!(out, "\n--- console of instance {instance}")?;
+        }
+        let piece_end = piece.offset + piece.data.len() as i64;
+        if piece_end <= end {
+            continue;
+        }
+        if piece.offset > end {
+            writeln!(out, "\n--- {} bytes of console output lost", piece.offset - end)?;
+            end = piece.offset;
+        }
+        out.write_all(&piece.data[(end - piece.offset) as usize..])?;
+        out.flush()?;
+        end = piece_end;
+    }
+    let _ = service.detachConsole(&callback);
+    Ok(taken)
 }
 
 fn state_name(state: VmState) -> String {
@@ -178,6 +273,9 @@ fn main() -> Result<()> {
             },
         )?,
         Command::Watch { wait } => follow(&service, Duration::from_secs(wait), || Ok(0), |_| None)?,
+        Command::Console { new_only, send, raw, follow } => {
+            console(&service, new_only, send, raw, Duration::from_secs(follow))?
+        }
     };
     std::process::exit(if ok { 0 } else { 1 });
 }

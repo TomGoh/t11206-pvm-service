@@ -7,18 +7,28 @@
 //! control app declares). Callbacks get every snapshot the controller publishes; registering one
 //! returns the snapshot it starts from, under the same lock that publishing takes, so no change
 //! falls between the two. A callback whose process dies is dropped.
+//!
+//! The serial console (see `console`) is served to the same callers: attaching returns the kept
+//! output and subscribes the client to the rest, and writing types into the running guest. The
+//! console gives full control of the guest's shell, which is why it needs the same permission as
+//! starting and stopping. Console contents are never logged.
 
 use crate::config::{Protection, VmConfig};
+use crate::console::{self, Console, InputError, Listener, SendError, MAX_INPUT};
 use crate::controller::{Backend, Controller};
 use crate::machine::{Refused, Snapshot, VmState};
 use android_os_permissions_aidl::aidl::android::os::IPermissionController::IPermissionController;
 use binder::{
-    DeathRecipient, ExceptionCode, IBinder, Interface, Result as BinderResult, Status, Strong,
-    ThreadState,
+    DeathRecipient, ExceptionCode, IBinder, Interface, Result as BinderResult, SpIBinder, Status,
+    StatusCode, Strong, ThreadState,
 };
 use com_kylinos_xkernelvm::aidl::com::kylinos::xkernelvm::{
+    ConsoleOutput::ConsoleOutput,
     IXKernelVmCallback::IXKernelVmCallback,
-    IXKernelVmControl::{IXKernelVmControl, ERROR_BUSY, ERROR_RECLAIM_PENDING, ERROR_UNAVAILABLE},
+    IXKernelVmConsoleCallback::IXKernelVmConsoleCallback,
+    IXKernelVmControl::{
+        IXKernelVmControl, ERROR_BUSY, ERROR_NOT_RUNNING, ERROR_RECLAIM_PENDING, ERROR_UNAVAILABLE,
+    },
     VmState::VmState as AidlVmState,
     VmStatus::VmStatus,
 };
@@ -133,6 +143,112 @@ impl Callbacks {
     }
 }
 
+fn aidl_output(output: console::Output) -> ConsoleOutput {
+    ConsoleOutput {
+        instance: output.instance as i64,
+        offset: output.offset as i64,
+        data: output.data,
+    }
+}
+
+struct ConsoleListener(Strong<dyn IXKernelVmConsoleCallback>);
+
+impl Listener for ConsoleListener {
+    fn send(&self, output: &console::Output) -> Result<(), SendError> {
+        match self.0.onConsoleOutput(&aidl_output(output.clone())) {
+            Ok(()) => Ok(()),
+            Err(e) if e.transaction_error() == StatusCode::DEAD_OBJECT => Err(SendError::Gone),
+            Err(e) => Err(SendError::Lost(e.to_string())),
+        }
+    }
+}
+
+struct Attached {
+    binder: SpIBinder,
+    id: u64,
+    _death: DeathRecipient,
+}
+
+/// The console clients, by Binder object. The attached list is locked before the console.
+pub struct ConsoleClients {
+    console: Arc<Console>,
+    attached: Mutex<Vec<Attached>>,
+}
+
+impl ConsoleClients {
+    pub fn new(console: Arc<Console>) -> Arc<Self> {
+        Arc::new(Self { console, attached: Mutex::new(Vec::new()) })
+    }
+
+    fn attach(
+        self: &Arc<Self>,
+        callback: &Strong<dyn IXKernelVmConsoleCallback>,
+    ) -> BinderResult<ConsoleOutput> {
+        let mut binder = callback.as_binder();
+        let mut attached = self.attached.lock().unwrap();
+        // Attaching again resynchronises: the earlier registration goes first.
+        if let Some(pos) = attached.iter().position(|a| a.binder == binder) {
+            self.console.detach(attached.remove(pos).id);
+        }
+        let (id, history) = self.console.attach(Box::new(ConsoleListener(callback.clone())));
+        let weak: Weak<Self> = Arc::downgrade(self);
+        let mut death = DeathRecipient::new(move || {
+            if let Some(clients) = weak.upgrade() {
+                clients.forget(id);
+                info!("console client {id} died");
+            }
+        });
+        if let Err(e) = binder.link_to_death(&mut death) {
+            self.console.detach(id);
+            return Err(e.into());
+        }
+        attached.push(Attached { binder, id, _death: death });
+        info!("console client {id} attached at {}+{}", history.offset, history.data.len());
+        Ok(aidl_output(history))
+    }
+
+    fn forget(&self, id: u64) {
+        self.attached.lock().unwrap().retain(|a| a.id != id);
+        self.console.detach(id);
+    }
+
+    fn detach(&self, callback: &Strong<dyn IXKernelVmConsoleCallback>) {
+        let binder = callback.as_binder();
+        let mut attached = self.attached.lock().unwrap();
+        attached.retain(|a| {
+            if a.binder == binder {
+                self.console.detach(a.id);
+                false
+            } else {
+                true
+            }
+        });
+    }
+
+    fn write(&self, data: &[u8]) -> BinderResult<()> {
+        self.console.write(data).map_err(|e| match e {
+            InputError::NotRunning => {
+                Status::new_service_specific_error_str(ERROR_NOT_RUNNING, Some("no instance runs"))
+            }
+            InputError::Full { written } => Status::new_service_specific_error_str(
+                ERROR_BUSY,
+                Some(format!(
+                    "the guest has not read the earlier input ({written} of {} bytes taken)",
+                    data.len()
+                )),
+            ),
+            InputError::TooLarge => Status::new_exception_str(
+                ExceptionCode::ILLEGAL_ARGUMENT,
+                Some(format!("at most {MAX_INPUT} bytes per write")),
+            ),
+            InputError::Io(e) => Status::new_service_specific_error_str(
+                ERROR_NOT_RUNNING,
+                Some(format!("the console input is closed: {e}")),
+            ),
+        })
+    }
+}
+
 fn aidl_state(state: VmState) -> AidlVmState {
     match state {
         VmState::Unavailable => AidlVmState::UNAVAILABLE,
@@ -150,11 +266,16 @@ fn aidl_state(state: VmState) -> AidlVmState {
 pub struct ControlService<B: Backend> {
     controller: Controller<B>,
     callbacks: Arc<Callbacks>,
+    console: Arc<ConsoleClients>,
 }
 
 impl<B: Backend> ControlService<B> {
-    pub fn new(controller: Controller<B>, callbacks: Arc<Callbacks>) -> Self {
-        Self { controller, callbacks }
+    pub fn new(
+        controller: Controller<B>,
+        callbacks: Arc<Callbacks>,
+        console: Arc<ConsoleClients>,
+    ) -> Self {
+        Self { controller, callbacks, console }
     }
 }
 
@@ -219,5 +340,24 @@ impl<B: Backend> IXKernelVmControl for ControlService<B> {
         check_caller()?;
         self.callbacks.unregister(callback);
         Ok(())
+    }
+
+    fn attachConsole(
+        &self,
+        callback: &Strong<dyn IXKernelVmConsoleCallback>,
+    ) -> BinderResult<ConsoleOutput> {
+        check_caller()?;
+        self.console.attach(callback)
+    }
+
+    fn detachConsole(&self, callback: &Strong<dyn IXKernelVmConsoleCallback>) -> BinderResult<()> {
+        check_caller()?;
+        self.console.detach(callback);
+        Ok(())
+    }
+
+    fn writeConsole(&self, data: &[u8]) -> BinderResult<()> {
+        check_caller()?;
+        self.console.write(data)
     }
 }

@@ -5,7 +5,9 @@
 
 package com.kylinos.xkernelvm;
 
+import com.kylinos.xkernelvm.ConsoleOutput;
 import com.kylinos.xkernelvm.IXKernelVmCallback;
+import com.kylinos.xkernelvm.IXKernelVmConsoleCallback;
 import com.kylinos.xkernelvm.VmStatus;
 
 /**
@@ -22,6 +24,8 @@ interface IXKernelVmControl {
     const int ERROR_BUSY = 2;
     /** Service-specific error: the last instance is not confirmed gone; request a stop first. */
     const int ERROR_RECLAIM_PENDING = 3;
+    /** Service-specific error: console input needs a running instance. */
+    const int ERROR_NOT_RUNNING = 4;
 
     /** The current snapshot. Never creates or restarts the VM. */
     VmStatus getStatus();
@@ -47,4 +51,21 @@ interface IXKernelVmControl {
     VmStatus registerCallback(IXKernelVmCallback callback);
 
     void unregisterCallback(IXKernelVmCallback callback);
+
+    /**
+     * Attaches to the serial console of the latest instance: returns what the service kept of
+     * its output (the last 64 KiB) and delivers every later piece to the callback, so nothing
+     * falls between the two. Attaching a callback that is attached already resynchronises it.
+     * The console of an instance stays readable after it stopped, until the next start.
+     */
+    ConsoleOutput attachConsole(IXKernelVmConsoleCallback callback);
+
+    void detachConsole(IXKernelVmConsoleCallback callback);
+
+    /**
+     * Types into the serial console of the running instance; the guest echoes what it reads.
+     * At most 4096 bytes. ERROR_NOT_RUNNING when no instance runs, ERROR_BUSY when the guest has
+     * not read the earlier input (nothing of this input, or only a part, was taken).
+     */
+    void writeConsole(in byte[] data);
 }

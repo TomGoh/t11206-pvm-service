@@ -27,3 +27,8 @@ allow xkernel_vm_service xkernel_vm_data_file:file create_file_perms;
 # The reclaim check reads /proc/<pid>/{cmdline,stat} of the VM's crosvm.
 r_dir_file(xkernel_vm_service, crosvm)
 r_dir_file(xkernel_vm_service, virtualizationmanager)
+
+# The serial console: the service creates the pipes and passes the guest ends to its virtmgr,
+# which hands them to crosvm (as AVF's own clients such as CompOS do).
+allow { crosvm virtualizationmanager } xkernel_vm_service:fd use;
+allow { crosvm virtualizationmanager } xkernel_vm_service:fifo_file { getattr ioctl read write };

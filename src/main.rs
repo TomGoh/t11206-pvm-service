@@ -14,9 +14,13 @@
 //! nothing. If this service itself dies, the virtualization manager it spawned exits and takes
 //! the VM with it; the next run finds anything left over before accepting a start (see
 //! `controller` and `reclaim`).
+//!
+//! The VM's serial console is held here too (see `console`), so clients can read and type into it
+//! however often they come and go.
 
 mod avf;
 mod config;
+mod console;
 mod controller;
 mod machine;
 mod reclaim;
@@ -24,8 +28,9 @@ mod service;
 
 use crate::avf::AvfBackend;
 use crate::config::{VmConfig, VIRTMGR_PATH};
+use crate::console::Console;
 use crate::controller::{Controller, Settings};
-use crate::service::{Callbacks, ControlService, SERVICE_NAME};
+use crate::service::{Callbacks, ConsoleClients, ControlService, SERVICE_NAME};
 use anyhow::{Context, Result};
 use binder::{BinderFeatures, ProcessState};
 use clap::Parser;
@@ -93,12 +98,14 @@ fn try_main() -> Result<()> {
         let callbacks = callbacks.clone();
         Box::new(move |snapshot| callbacks.publish(snapshot))
     };
-    let backend = AvfBackend::new(config.clone()).context("Can't prepare the AVF backend")?;
+    let console = Console::new();
+    let backend = AvfBackend::new(config.clone(), console.clone())
+        .context("Can't prepare the AVF backend")?;
     let controller = Controller::new(backend, settings, preflight, publish, Box::new(boot_time_ms));
     info!("initial status: {:?}", controller.status());
 
     let service = BnXKernelVmControl::new_binder(
-        ControlService::new(controller, callbacks),
+        ControlService::new(controller, callbacks, ConsoleClients::new(console)),
         BinderFeatures::default(),
     );
     binder::add_service(SERVICE_NAME, service.as_binder())

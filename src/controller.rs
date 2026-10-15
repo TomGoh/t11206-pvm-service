@@ -41,10 +41,11 @@ pub trait Instance: Send + Sync + 'static {
 /// Creates instances.
 pub trait Backend: Send + Sync + 'static {
     type Instance: Instance;
-    /// Creates and starts the VM. `on_death` must be called exactly once when AVF reports the VM
-    /// dead or the virtualization manager serving it dies.
+    /// Creates and starts the VM of `generation`. `on_death` must be called exactly once when AVF
+    /// reports the VM dead or the virtualization manager serving it dies.
     fn create_and_start(
         &self,
+        generation: u64,
         on_death: Box<dyn FnOnce(Exit) + Send>,
     ) -> Result<Self::Instance, String>;
 }
@@ -254,7 +255,7 @@ impl<B: Backend> Inner<B> {
                 inner.post(Event::Died { generation, exit });
             }
         });
-        match self.backend.create_and_start(on_death) {
+        match self.backend.create_and_start(generation, on_death) {
             Ok(instance) => {
                 let cid = instance.cid();
                 *self.instance.lock().unwrap() = Some((generation, Arc::new(instance)));
@@ -424,7 +425,7 @@ mod tests {
         let dir = root.join(pid.to_string());
         fs::create_dir_all(&dir).unwrap();
         fs::write(dir.join("cmdline"), format!("{argv0}\0run\0")).unwrap();
-        let zeros = vec!["0"; 18].join(" ");
+        let zeros = ["0"; 18].join(" ");
         fs::write(dir.join("stat"), format!("{pid} (crosvm) {state} {zeros} {pid}000 0\n"))
             .unwrap();
     }
@@ -453,6 +454,7 @@ mod tests {
         type Instance = FakeInstance;
         fn create_and_start(
             &self,
+            _generation: u64,
             on_death: Box<dyn FnOnce(Exit) + Send>,
         ) -> Result<FakeInstance, String> {
             self.starts.fetch_add(1, Ordering::SeqCst);

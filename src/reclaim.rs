@@ -125,7 +125,7 @@ mod tests {
             }
             fs::write(dir.join("cmdline"), cmdline).unwrap();
             // Fields 4..21 are zeros; field 22 is the start time.
-            let zeros = vec!["0"; 18].join(" ");
+            let zeros = ["0"; 18].join(" ");
             fs::write(
                 dir.join("stat"),
                 format!("{pid} ({comm}) {state} {zeros} {start_time} 0 0\n"),
@@ -144,7 +144,7 @@ mod tests {
 
     #[test]
     fn parses_stat_with_awkward_comm() {
-        let zeros = vec!["0"; 18].join(" ");
+        let zeros = ["0"; 18].join(" ");
         let stat = format!("42 (a) b (c)) S {zeros} 12345 0 0");
         assert_eq!(parse_stat(&stat), Some(('S', 12345)));
         assert_eq!(parse_stat("garbage"), None);
