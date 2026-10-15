@@ -3,6 +3,9 @@
 
 //! Runs the lifecycle machine against AVF.
 //!
+//! "AVF" here stands for the backend that runs the VM: AVF itself (`avf`), or this service
+//! running crosvm directly (`direct`); "the AVF objects" are the backend's instance.
+//!
 //! Requests (from Binder threads) and events (from AVF callbacks, timers and probes) lock the
 //! [`Machine`], apply one transition, and queue the resulting actions to one executor thread, so
 //! the AVF objects of the instance are only created, stopped and released in order. Every

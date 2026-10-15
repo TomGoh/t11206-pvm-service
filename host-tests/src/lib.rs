@@ -4,6 +4,8 @@ pub mod config;
 pub mod console;
 #[path = "../../src/controller.rs"]
 pub mod controller;
+#[path = "../../src/direct.rs"]
+pub mod direct;
 #[path = "../../src/machine.rs"]
 pub mod machine;
 #[path = "../../src/reclaim.rs"]

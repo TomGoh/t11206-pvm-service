@@ -27,11 +27,26 @@
 //! with `"without_firmware"` only runs that way if the product declares it in
 //! `/system_ext/etc/avf/protected_vms_without_firmware*.xml` for this service's executable.
 //!
+//! `backend` says who runs crosvm: `"avf"` (the default) creates the VM through AVF, which needs
+//! the Virtualization module's support for declared firmware-less VMs; `"direct"` runs a crosvm
+//! binary itself, for products that may not change AVF (see `direct`). The direct backend needs a
+//! `direct` section:
+//!
+//! ```json
+//! "backend": "direct",
+//! "direct": { "crosvm": "/system_ext/bin/xkernel_crosvm", "cid": 1024 }
+//! ```
+//!
+//! It does not use AVF's admission, so it checks neither virtmgr nor the AVF property; whether a
+//! protected VM may run is then up to the hypervisor alone.
+//!
 //! The preconditions only read files and properties, so evaluating them never changes anything.
 
 use anyhow::{bail, ensure, Context, Result};
+use log::info;
 use serde::Deserialize;
-use std::fs;
+use std::fs::{self, OpenOptions};
+use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 
 /// Where the virtualization manager AVF spawns for each client lives.
@@ -70,6 +85,39 @@ impl Protection {
     }
 }
 
+/// Who runs the VM's crosvm.
+#[derive(Clone, Copy, Debug, Default, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum BackendKind {
+    /// AVF creates and runs the VM.
+    #[default]
+    Avf,
+    /// This service runs crosvm itself.
+    Direct,
+}
+
+/// The settings of the direct backend.
+#[derive(Clone, Debug, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct DirectConfig {
+    /// The crosvm binary to run: a build with the hypervisor's backend.
+    pub crosvm: PathBuf,
+    /// The vsock CID. It must stay below [`AVF_FIRST_CID`] so it never collides with a VM AVF
+    /// runs. Without one the VM has no vsock device and no readiness handshake.
+    #[serde(default)]
+    pub cid: Option<u32>,
+    /// crosvm's `--log-level`.
+    #[serde(default = "default_log_level")]
+    pub log_level: String,
+    /// How long a requested stop waits for crosvm to exit before killing it; less than the stop
+    /// deadline, so a killed VM is still a normal stop.
+    #[serde(default = "default_kill_after")]
+    pub kill_after_seconds: u64,
+}
+
+/// The first CID AVF hands out; the direct backend's CID stays below it.
+pub const AVF_FIRST_CID: u32 = 2048;
+
 #[derive(Clone, Debug, Deserialize, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
 pub struct DiskConfig {
@@ -78,6 +126,29 @@ pub struct DiskConfig {
     /// Create the image as a sparse file of this size when it is missing (writable disks only).
     #[serde(default)]
     pub create_size_mib: Option<u64>,
+}
+
+impl DiskConfig {
+    /// Creates the image when it is missing and may be created; the backends call this right
+    /// before a start (it is the one thing here that writes).
+    pub fn create_if_missing(&self) -> Result<()> {
+        let Some(size_mib) = self.create_size_mib else { return Ok(()) };
+        if self.path.exists() {
+            return Ok(());
+        }
+        if let Some(parent) = self.path.parent() {
+            fs::create_dir_all(parent)
+                .with_context(|| format!("Can't create {}", parent.display()))?;
+        }
+        let file = OpenOptions::new()
+            .create_new(true)
+            .write(true)
+            .open(&self.path)
+            .with_context(|| format!("Can't create {}", self.path.display()))?;
+        file.set_len(size_mib * 1024 * 1024)?;
+        info!("created sparse {} ({size_mib} MiB)", self.path.display());
+        Ok(())
+    }
 }
 
 #[derive(Clone, Debug, Deserialize, PartialEq, Eq)]
@@ -119,6 +190,11 @@ pub struct VmConfig {
     /// How long the reclaim check waits for the VM's processes to exit after AVF's death report.
     #[serde(default = "default_reclaim_window")]
     pub reclaim_window_seconds: u64,
+    #[serde(default)]
+    pub backend: BackendKind,
+    /// Required with `"backend": "direct"`, refused otherwise.
+    #[serde(default)]
+    pub direct: Option<DirectConfig>,
 }
 
 fn default_hypervisor_device() -> PathBuf {
@@ -131,6 +207,12 @@ fn default_stop_timeout() -> u64 {
     30
 }
 fn default_reclaim_window() -> u64 {
+    10
+}
+fn default_log_level() -> String {
+    "info".to_owned()
+}
+fn default_kill_after() -> u64 {
     10
 }
 
@@ -179,10 +261,34 @@ impl VmConfig {
         }
         ensure!(self.stop_timeout_seconds > 0, "stop_timeout_seconds must be positive");
         ensure!(self.reclaim_window_seconds > 0, "reclaim_window_seconds must be positive");
+        match (self.backend, &self.direct) {
+            (BackendKind::Avf, None) => {}
+            (BackendKind::Avf, Some(_)) => bail!("a direct section needs \"backend\": \"direct\""),
+            (BackendKind::Direct, None) => bail!("\"backend\": \"direct\" needs a direct section"),
+            (BackendKind::Direct, Some(direct)) => {
+                ensure!(direct.crosvm.is_absolute(), "direct.crosvm must be an absolute path");
+                ensure!(
+                    self.protection != Protection::WithFirmware,
+                    "the direct backend runs no guest firmware"
+                );
+                if let Some(cid) = direct.cid {
+                    ensure!(
+                        (3..AVF_FIRST_CID).contains(&cid),
+                        "direct.cid must be 3..{AVF_FIRST_CID}"
+                    );
+                } else {
+                    ensure!(self.readiness.is_none(), "readiness needs direct.cid (vsock)");
+                }
+                ensure!(
+                    (1..self.stop_timeout_seconds).contains(&direct.kill_after_seconds),
+                    "direct.kill_after_seconds must be 1..stop_timeout_seconds"
+                );
+            }
+        }
         Ok(())
     }
 
-    /// The argv[0] AVF gives the VM's crosvm process.
+    /// The argv[0] AVF gives the VM's crosvm process; the direct backend uses the same.
     pub fn crosvm_process_name(&self) -> String {
         format!("crosvm_{}", self.name)
     }
@@ -200,12 +306,26 @@ impl VmConfig {
                 self.hypervisor_device.display()
             ));
         }
-        if !virtmgr.exists() {
-            return Err(format!("AVF missing: {} does not exist", virtmgr.display()));
-        }
-        let required = self.protection.property();
-        if !matches!(property(required).as_deref(), Some("1") | Some("true")) {
-            return Err(format!("hypervisor does not report {required}"));
+        match &self.direct {
+            None => {
+                if !virtmgr.exists() {
+                    return Err(format!("AVF missing: {} does not exist", virtmgr.display()));
+                }
+                let required = self.protection.property();
+                if !matches!(property(required).as_deref(), Some("1") | Some("true")) {
+                    return Err(format!("hypervisor does not report {required}"));
+                }
+            }
+            Some(direct) => {
+                let executable = fs::metadata(&direct.crosvm)
+                    .is_ok_and(|m| m.is_file() && m.permissions().mode() & 0o111 != 0);
+                if !executable {
+                    return Err(format!(
+                        "crosvm missing: {} is not executable",
+                        direct.crosvm.display()
+                    ));
+                }
+            }
         }
         if !self.kernel.is_file() {
             return Err(format!("kernel image missing: {}", self.kernel.display()));
@@ -266,6 +386,73 @@ mod tests {
         assert_eq!(c.name, "xkernel_vm");
         assert_eq!(c.protection, Protection::WithoutFirmware);
         assert_eq!(c.crosvm_process_name(), "crosvm_xkernel_vm");
+    }
+
+    #[test]
+    fn the_shipped_direct_config_is_valid() {
+        let c = VmConfig::parse(include_str!("../etc/xkernel_vm.direct.json")).unwrap();
+        assert_eq!(c.backend, BackendKind::Direct);
+        let d = c.direct.as_ref().unwrap();
+        assert!(d.cid.is_some_and(|cid| cid < AVF_FIRST_CID));
+        assert!(d.kill_after_seconds < c.stop_timeout_seconds);
+        // The same instance as the AVF config, only run differently.
+        let avf = VmConfig::parse(include_str!("../etc/xkernel_vm.json")).unwrap();
+        assert_eq!(
+            (c.name, c.memory_mib, c.cpus, c.disks),
+            (avf.name, avf.memory_mib, avf.cpus, avf.disks)
+        );
+    }
+
+    #[test]
+    fn rejects_invalid_direct_configs() {
+        let avf = example(Path::new("/x"));
+        let direct = avf.replace(
+            r#""state_dir""#,
+            r#""backend": "direct", "direct": { "crosvm": "/x/crosvm", "cid": 1024 }, "state_dir""#,
+        );
+        assert_eq!(VmConfig::parse(&direct).unwrap().backend, BackendKind::Direct);
+        for (from, to) in [
+            (r#""backend": "direct", "#, ""),
+            (
+                r#""backend": "direct", "direct": { "crosvm": "/x/crosvm", "cid": 1024 }, "#,
+                r#""backend": "direct", "#,
+            ),
+            (r#""crosvm": "/x/crosvm""#, r#""crosvm": "crosvm""#),
+            (r#""cid": 1024"#, r#""cid": 2048"#),
+            (r#""cid": 1024"#, r#""cid": 2"#),
+            (r#""cid": 1024"#, r#""cid": 1024, "kill_after_seconds": 30"#),
+            (r#""protection": "without_firmware""#, r#""protection": "with_firmware""#),
+            (r#", "cid": 1024 }"#, r#" }, "readiness": { "vsock_port": 5000 }"#),
+        ] {
+            assert!(direct.contains(from), "{from}");
+            assert!(VmConfig::parse(&direct.replace(from, to)).is_err(), "accepted {to}");
+        }
+    }
+
+    #[test]
+    fn direct_preflight_needs_crosvm_not_avf() {
+        let dir = std::env::temp_dir().join(format!("xkvm-config-direct-{}", std::process::id()));
+        fs::create_dir_all(&dir).unwrap();
+        let json = example(&dir).replace(
+            r#""state_dir""#,
+            &format!(
+                r#""backend": "direct", "direct": {{ "crosvm": "{}/crosvm" }}, "state_dir""#,
+                dir.display()
+            ),
+        );
+        let c = VmConfig::parse(&json).unwrap();
+        for f in ["xhyper", "kernel.bin", "dummy.img"] {
+            fs::write(dir.join(f), b"x").unwrap();
+        }
+        let no_props = props(&[]);
+        let check = || c.preflight(&dir.join("no-virtmgr"), &no_props);
+        assert!(check().unwrap_err().contains("crosvm missing"));
+        fs::write(dir.join("crosvm"), b"#!/bin/sh\n").unwrap();
+        assert!(check().unwrap_err().contains("not executable"));
+        fs::set_permissions(dir.join("crosvm"), fs::Permissions::from_mode(0o755)).unwrap();
+        // Neither virtmgr nor the AVF property is needed.
+        assert_eq!(check(), Ok(()));
+        fs::remove_dir_all(&dir).unwrap();
     }
 
     #[test]

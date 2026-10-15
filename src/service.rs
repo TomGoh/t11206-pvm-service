@@ -13,7 +13,7 @@
 //! console gives full control of the guest's shell, which is why it needs the same permission as
 //! starting and stopping. Console contents are never logged.
 
-use crate::config::{Protection, VmConfig};
+use crate::config::{BackendKind, Protection, VmConfig};
 use crate::console::{self, Console, InputError, Listener, SendError, MAX_INPUT};
 use crate::controller::{Backend, Controller};
 use crate::machine::{Refused, Snapshot, VmState};
@@ -52,6 +52,7 @@ struct StaticFields {
     protected_vm: bool,
     without_firmware: bool,
     readiness_configured: bool,
+    via_avf: bool,
 }
 
 struct Entry {
@@ -76,6 +77,7 @@ impl Callbacks {
                 protected_vm: config.protection.is_protected(),
                 without_firmware: config.protection == Protection::WithoutFirmware,
                 readiness_configured: config.readiness.is_some(),
+                via_avf: config.backend == BackendKind::Avf,
             },
             entries: Mutex::new((0, Vec::new())),
         })
@@ -100,6 +102,7 @@ impl Callbacks {
             withoutFirmware: f.without_firmware,
             diceAvailable: false,
             readinessConfigured: f.readiness_configured,
+            viaAvf: f.via_avf,
         }
     }
 

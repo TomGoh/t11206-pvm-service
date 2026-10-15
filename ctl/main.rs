@@ -173,7 +173,7 @@ fn print(status: &VmStatus) {
     };
     println!(
         "state={} seq={} op={} instance={} cid={} reclaim_confirmed={} protected={} without_firmware={} \
-         dice={} memory_mib={} cpus={} readiness={}{} reason={:?} last_exit={:?} session={}",
+         dice={} memory_mib={} cpus={} readiness={} via_avf={}{} reason={:?} last_exit={:?} session={}",
         state_name(status.state),
         status.seq,
         status.operationId,
@@ -186,6 +186,7 @@ fn print(status: &VmStatus) {
         status.memoryMib,
         status.cpuCount,
         status.readinessConfigured,
+        status.viaAvf,
         uptime,
         status.reason,
         status.lastExit,

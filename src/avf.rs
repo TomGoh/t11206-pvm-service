@@ -92,9 +92,7 @@ impl AvfBackend {
         let config = &self.config;
         let mut disks = Vec::new();
         for disk in &config.disks {
-            if let Some(size_mib) = disk.create_size_mib {
-                create_sparse_if_missing(&disk.path, size_mib)?;
-            }
+            disk.create_if_missing()?;
             disks.push(DiskImage {
                 image: Some(open_pfd(&disk.path, disk.writable)?),
                 writable: disk.writable,
@@ -201,23 +199,6 @@ fn open_pfd(path: &Path, writable: bool) -> Result<ParcelFileDescriptor> {
         .open(path)
         .with_context(|| format!("Can't open {}", path.display()))?;
     Ok(ParcelFileDescriptor::new(file))
-}
-
-fn create_sparse_if_missing(path: &Path, size_mib: u64) -> Result<()> {
-    if path.exists() {
-        return Ok(());
-    }
-    if let Some(parent) = path.parent() {
-        fs::create_dir_all(parent).with_context(|| format!("Can't create {}", parent.display()))?;
-    }
-    let file = OpenOptions::new()
-        .create_new(true)
-        .write(true)
-        .open(path)
-        .with_context(|| format!("Can't create {}", path.display()))?;
-    file.set_len(size_mib * 1024 * 1024)?;
-    info!("created sparse {} ({size_mib} MiB)", path.display());
-    Ok(())
 }
 
 /// The instance ID is persistent per instance; it is random, as nothing derives a secret from it

@@ -42,4 +42,6 @@ parcelable VmStatus {
     boolean diceAvailable;
     /** The instance has a readiness handshake; without one it never reaches READY. */
     boolean readinessConfigured;
+    /** AVF runs the VM; false when the service runs crosvm itself (the direct backend). */
+    boolean viaAvf;
 }

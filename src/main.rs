@@ -17,19 +17,24 @@
 //!
 //! The VM's serial console is held here too (see `console`), so clients can read and type into it
 //! however often they come and go.
+//!
+//! The instance config chooses who runs crosvm: AVF (`avf`), or this service itself (`direct`),
+//! for products that may not change AVF. Everything else is the same for both.
 
 mod avf;
 mod config;
 mod console;
 mod controller;
+mod direct;
 mod machine;
 mod reclaim;
 mod service;
 
 use crate::avf::AvfBackend;
-use crate::config::{VmConfig, VIRTMGR_PATH};
+use crate::config::{BackendKind, VmConfig, VIRTMGR_PATH};
 use crate::console::Console;
-use crate::controller::{Controller, Settings};
+use crate::controller::{Backend, Controller, Settings};
+use crate::direct::DirectBackend;
 use crate::service::{Callbacks, ConsoleClients, ControlService, SERVICE_NAME};
 use anyhow::{Context, Result};
 use binder::{BinderFeatures, ProcessState};
@@ -70,6 +75,22 @@ fn try_main() -> Result<()> {
     ProcessState::start_thread_pool();
     info!("instance config {}: {config:?}", args.config.display());
 
+    let console = Console::new();
+    match config.backend {
+        BackendKind::Avf => {
+            let backend = AvfBackend::new(config.clone(), console.clone())
+                .context("Can't prepare the AVF backend")?;
+            serve(config, backend, console)
+        }
+        BackendKind::Direct => {
+            let backend = DirectBackend::new(config.clone(), console.clone())
+                .context("Can't prepare the direct backend")?;
+            serve(config, backend, console)
+        }
+    }
+}
+
+fn serve<B: Backend>(config: VmConfig, backend: B, console: std::sync::Arc<Console>) -> Result<()> {
     let boot_id = boot_id();
     let session_id = format!("{boot_id}/{}/{}", std::process::id(), boot_time_ms());
     let callbacks = Callbacks::new(&config, session_id);
@@ -98,9 +119,6 @@ fn try_main() -> Result<()> {
         let callbacks = callbacks.clone();
         Box::new(move |snapshot| callbacks.publish(snapshot))
     };
-    let console = Console::new();
-    let backend = AvfBackend::new(config.clone(), console.clone())
-        .context("Can't prepare the AVF backend")?;
     let controller = Controller::new(backend, settings, preflight, publish, Box::new(boot_time_ms));
     info!("initial status: {:?}", controller.status());
 

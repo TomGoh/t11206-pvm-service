@@ -8,6 +8,9 @@
 //! readiness, confirm that its resources are gone). Nothing here touches Binder, AVF or the file
 //! system, so every rule is tested on the host.
 //!
+//! "AVF" below stands for the backend that runs the VM: AVF itself, or this service running
+//! crosvm directly (see `direct`); the rules are the same for both.
+//!
 //! What a state means (the UI shows exactly these):
 //!
 //! | State | Meaning |

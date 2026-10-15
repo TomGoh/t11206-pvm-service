@@ -14,6 +14,13 @@ x-kernel 虚拟机的原生控制服务。它是这台设备上 x-kernel 虚拟�
 
 状态与含义见 `src/machine.rs` 开头的说明，接口见 `aidl/com/kylinos/xkernelvm/`。
 
+## 两种后端
+
+实例配置的 `backend` 决定由谁运行 crosvm，状态机、回收核实、控制台、Binder 接口、命令行工具和应用对两者完全相同：
+
+- `avf`（默认）：经 AVF 创建，需要 Virtualization 模块的配套改动（见下节）。
+- `direct`：备用方案，用于不允许修改 AVF 的产品。服务自己运行一个带虚拟化层后端的 crosvm（`direct.crosvm`），不经 virtmgr，不需要 AVF 声明文件和 AVF 能力属性，示例配置是 `etc/xkernel_vm.direct.json`。命令行与 virtmgr 为这个实例生成的相同（平板实测），只去掉 AVF 独有的设备树覆盖层，日志和故障管道改接空设备，vsock CID 由配置给出并低于 AVF 的分配范围。crosvm 是服务的子进程，进程名同样是 `crosvm_<name>`；它的父进程死亡信号是 SIGKILL，服务死亡时随之结束。停止时先经 crosvm 的控制套接字请求退出，失败或超过 `kill_after_seconds` 仍未退出就强制结束。crosvm 自己的日志写到 `state_dir/crosvm.log`。状态里的 `viaAvf` 表明当前是哪一种。
+
 ## 与 AVF 的关系
 
 服务把实例配置写成 `VirtualMachineRawConfig`（`protectedVm=true`），经 `libvmclient` 在第一次启动时拉起一个 virtmgr，之后的启动都复用它（长期运行的客户端无法按次释放 virtmgr，见 `src/avf.rs` 开头）。默认配置是 2 个虚拟处理器、256 MiB 内存。virtmgr 是否以无固件模式启动由 AVF 决定：本仓库安装的 `/system_ext/etc/avf/protected_vms_without_firmware_xkernel.xml` 声明虚拟机 `xkernel_vm` 只能由 `/system_ext/bin/xkernel_vm_service` 运行，且虚拟化层要报告 `ro.boot.hypervisor.protected_vm_without_firmware.supported`。这需要 Virtualization 模块的配套改动（分支 `xhyper/protected-without-firmware`）。
@@ -27,6 +34,7 @@ x-kernel 虚拟机的原生控制服务。它是这台设备上 x-kernel 虚拟�
 | `src/reclaim.rs` | 回收核实：按进程号加启动时间和进程名查残留。 |
 | `src/controller.rs` | 把状态机接到执行线程、定时器和就绪探测上。 |
 | `src/avf.rs` | AVF 后端（`libvmclient`）。 |
+| `src/direct.rs` | 不经 AVF 的后端：自己运行 crosvm、停止与强制结束、退出码解释。 |
 | `src/console.rs` | 串口控制台：每个实例的输入输出管道、输出历史与推送。 |
 | `src/service.rs` | `IXKernelVmControl` 的 Binder 实现与调用方校验。 |
 | `ctl/main.rs` | 命令行客户端 `xkernel_vmctl status|start|stop|watch|console`。 |
@@ -46,3 +54,4 @@ x-kernel 虚拟机的原生控制服务。它是这台设备上 x-kernel 虚拟�
 - `/dev/xhyper` 目前只有 root 可访问，服务以 root 运行；SELinux 策略尚未在 Enforcing 下验证。
 - 没有就绪握手配置时实例不会显示为“服务可用”；x-kernel 侧的握手端口待定。
 - 无固件模式不经固件认证镜像，也不传递 DICE 身份；宿主复位时不清理该虚拟机内存（与带固件路径不同）。
+- 直接后端：crosvm 二进制要由产品另行安装（示例配置假定在 `/system_ext/bin/xkernel_crosvm`），本仓库不带这个预编译文件；crosvm 在服务的 SELinux 域里运行，正式产品需要给它定义独立的域并授予 `/dev/xhyper`、`/dev/vhost-vsock` 等权限，尚未编写和验证；服务重启后若发现上一轮的 crosvm 仍在（父进程死亡信号失效时才会发生），只会报告“回收待核实”，不会替它结束进程。
