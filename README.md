@@ -43,7 +43,7 @@ x-kernel 虚拟机的原生控制服务。它是这台设备上 x-kernel 虚拟�
 | `etc/` | 实例配置（`xkernel_vm.json` 为直接后端，`xkernel_vm.avf.json` 为经 AVF）、AVF 声明、init 脚本。 |
 | `sepolicy/` | system_ext 策略；`sepolicy/vendor/README.md` 说明设备节点的厂商侧标签。 |
 | `product.mk` | 产品集成片段。 |
-| `host-tests/` | 在开发机上运行纯逻辑模块的单元测试：`cd host-tests && cargo test`。 |
+| `host-tests/` | 在开发机上运行纯逻辑模块的单元测试：`cd host-tests && cargo test`；GitHub 在每次推送和拉取请求时运行它，并检查格式和 clippy（`.github/workflows/host-tests.yml`）。服务本身只能在 Android 源码树里编译，不在 CI 中构建。 |
 
 ## 构建
 

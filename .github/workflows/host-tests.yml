@@ -1,0 +1,28 @@
+# Runs the service's host tests on every push and pull request: the state machine, configuration,
+# reclaim check and controller with a fake AVF, the console, and the direct backend with a fake
+# crosvm (on Linux also the parent-death-signal test). The service itself builds only in an
+# Android tree, so that is not run here.
+name: host-tests
+
+on:
+  push:
+  pull_request:
+  workflow_dispatch:
+
+jobs:
+  host-tests:
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: host-tests
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy, rustfmt
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: host-tests
+      - run: cargo fmt --check
+      - run: cargo clippy --all-targets -- -D warnings
+      - run: cargo test
