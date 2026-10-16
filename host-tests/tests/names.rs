@@ -1,4 +1,5 @@
-//! The service, the loader, the init script and the property contexts name the same properties.
+//! The service, the loader, the init script and the property contexts name the same properties,
+//! and the product makefile installs the modules modules.load lists.
 use std::fs;
 use xkernel_vm_service_host_tests::{driver, loader};
 
@@ -22,4 +23,21 @@ fn the_driver_properties_agree() {
             "{name} in property_contexts"
         );
     }
+}
+
+#[test]
+fn the_product_installs_the_listed_modules() {
+    let listed: Vec<String> = repo_file("etc/modules.load")
+        .lines()
+        .filter_map(|l| l.split('#').next().unwrap().split_whitespace().next().map(str::to_string))
+        .collect();
+    let mk = repo_file("product.mk");
+    let start = mk.find("XKERNEL_VM_MODULES :=").expect("module list in product.mk");
+    let installed: Vec<String> = mk[start..]
+        .lines()
+        .skip(1)
+        .map(|l| l.trim().trim_end_matches('\\').trim().to_string())
+        .take_while(|l| !l.is_empty())
+        .collect();
+    assert_eq!(installed, listed);
 }

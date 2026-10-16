@@ -27,7 +27,7 @@ x-kernel 虚拟机的原生控制服务。它是这台设备上 x-kernel 虚拟�
 
 开机时不加载宿主驱动，设备在有人启动虚拟机之前与原来一样。配置里有 `driver` 时，启动发现 `/dev/xhyper` 不存在（开机后的第一次启动），服务就向属性 `xkernel_vm.load_driver` 写入一个新的请求号；init 脚本据此启动 `xkernel_vm_loader`，它按 `/system_ext/etc/xkernel_vm/modules/modules.load` 的顺序加载同一目录里的模块（已加载的跳过），等到设备节点出现，设为 0666 root root（与 AOSP 的 `/dev/kvm` 相同，由 SELinux 限定只有 crosvm 域能打开），再把 `loaded <请求号>` 或 `failed <请求号>: <原因>` 写到 `xkernel_vm.driver_status`；服务等到这个结果再启动虚拟机，超过 `driver.timeout_seconds` 算失败。服务自己不加载模块：平台策略只把加载模块的权限给专门的域，回答应用请求的服务不应持有它。
 
-模块文件（`.ko`）要与设备的内核一致，随宿主驱动的构建交付，由产品放进 `/system_ext/etc/xkernel_vm/modules/`；本仓库只带加载顺序 `etc/modules.load`。设备节点的类型 `xhyper_device` 和标签也在本仓库的 system_ext 策略里，因为驱动随本包交付，而不是随厂商分区。若产品改由厂商分区交付驱动（例如 vendor_dlkm），类型、标签和权限就应改由厂商策略和厂商的 ueventd 规则给出。
+模块文件（`.ko`）要与设备的内核一致，随宿主驱动的构建交付，不放在本仓库：做镜像时设置 `XKERNEL_VM_MODULES_DIR` 指向放模块的目录，`product.mk` 把 `etc/modules.load` 列出的模块装到 `/system_ext/etc/xkernel_vm/modules/`（不设置就构建报错）；本仓库带加载顺序 `etc/modules.load`。设备节点的类型 `xhyper_device` 和标签也在本仓库的 system_ext 策略里，因为驱动随本包交付，而不是随厂商分区。若产品改由厂商分区交付驱动（例如 vendor_dlkm），类型、标签和权限就应改由厂商策略和厂商的 ueventd 规则给出。
 
 ## 经 AVF 时
 
