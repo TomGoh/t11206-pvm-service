@@ -53,3 +53,15 @@ T11206HXH6600007：按上面三步安装后重启，init 现场编译策略，�
 | `xkernel_vm.direct.dev.json` | 直接后端，磁盘与状态都在 `/data/local/tmp`。 |
 | `xkernel_vm.direct.data.dev.json` | 直接后端，可写盘与状态在产品位置 `/data/misc/xkernel_vm`。 |
 | `xkernel_vm.direct.selinux.dev.json` | 运行时加载 SELinux 策略的试验：启动器、按需加载驱动、串口就绪信号。 |
+| `vm-tool-negative.json` | 反向检查：AVF 的 `vm run --protected` 以未声明的调用方请求同名虚拟机，应被拒绝。 |
+
+## 经 pvmfw 启动的试验（`dev/pvmfw/`）
+
+2026-10-16 的试验：从 `/data/local/tmp` 加载厂商 pvmfw，用 crosvm 的 `--protected-vm-with-firmware` 启动签名的 x-kernel（实施记录 `t11206-pvmfw-trial-20261016`）。结论是客户机能启动，但 pvmfw 没有执行：这一模式下 crosvm 从内核入口启动，未签名的内核同样能启动，实例盘也没有被写入。
+
+| 文件 | 用途 |
+|---|---|
+| `sign-xkernel.sh` | 用厂商的 SM2 测试密钥给 x-kernel 加 AVB 哈希尾部，签名凑满 72 字节，并用公钥自检；在 aarch64 Linux 里运行。 |
+| `make-instance-img.py` | 生成 pvmfw 要找的实例盘：GPT 盘里一个名为 `vm-instance` 的分区，首块写实例头。 |
+| `pvmfw-trial.sh` | 主机侧：推送输入（`INPUTS` 指向签名与未签名内核、空实例盘所在的目录，`FW` 指向 pvmfw）；停掉服务的虚拟机；启动、停止试验虚拟机，查看日志。 |
+| `on-device-pvmfw.sh` | 平板侧：直接后端的命令行，换成自带固件模式，加上实例盘。 |
