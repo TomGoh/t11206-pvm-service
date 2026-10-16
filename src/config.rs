@@ -201,6 +201,18 @@ pub struct VmConfig {
 fn default_hypervisor_device() -> PathBuf {
     PathBuf::from("/dev/xhyper")
 }
+
+/// Whether `path` exists, asked with `access(F_OK)` instead of `stat`: platform policy forbids
+/// this service, a core domain, even `getattr` on a VM manager device such as /dev/xhyper (only
+/// crosvm may touch one), and the kernel asks SELinux nothing for an `F_OK` check.
+fn exists_without_stat(path: &Path) -> bool {
+    use std::os::unix::ffi::OsStrExt;
+    let Ok(path) = std::ffi::CString::new(path.as_os_str().as_bytes()) else {
+        return false;
+    };
+    // SAFETY: `path` is a NUL-terminated string that outlives the call.
+    unsafe { libc::access(path.as_ptr(), libc::F_OK) == 0 }
+}
 fn default_ready_timeout() -> u64 {
     60
 }
@@ -301,7 +313,7 @@ impl VmConfig {
         virtmgr: &Path,
         property: &dyn Fn(&str) -> Option<String>,
     ) -> Result<(), String> {
-        if !self.hypervisor_device.exists() {
+        if !exists_without_stat(&self.hypervisor_device) {
             return Err(format!(
                 "hypervisor driver missing: {} does not exist",
                 self.hypervisor_device.display()
@@ -379,6 +391,18 @@ mod tests {
         assert_eq!(c.readiness, None);
         assert_eq!(c.crosvm_process_name(), "crosvm_xkernel_vm");
         assert_eq!(c.protection.property(), PROP_PROTECTED_VM_WITHOUT_FIRMWARE);
+    }
+
+    #[test]
+    fn existence_is_checked_without_stat() {
+        let dir = std::env::temp_dir().join(format!("xkvm-exists-{}", std::process::id()));
+        fs::create_dir_all(&dir).unwrap();
+        let file = dir.join("xhyper");
+        assert!(!exists_without_stat(&file));
+        fs::write(&file, b"").unwrap();
+        assert!(exists_without_stat(&file));
+        assert!(!exists_without_stat(Path::new("/dev/null\0x")), "interior NUL");
+        fs::remove_dir_all(&dir).unwrap();
     }
 
     #[test]

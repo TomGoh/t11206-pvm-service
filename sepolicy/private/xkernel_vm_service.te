@@ -32,3 +32,30 @@ r_dir_file(xkernel_vm_service, virtualizationmanager)
 # which hands them to crosvm (as AVF's own clients such as CompOS do).
 allow { crosvm virtualizationmanager } xkernel_vm_service:fd use;
 allow { crosvm virtualizationmanager } xkernel_vm_service:fifo_file { getattr ioctl read write };
+
+# The direct backend: the service runs the product's crosvm build with the hypervisor's backend
+# (/system_ext/bin/xkernel_crosvm) itself. Platform policy lets only the crosvm domain open
+# kvm_device (/dev/vhost-vsock) and, among core domains, the VM manager devices (/dev/xhyper once
+# vendor policy gives it a vm_manager_device_type), and lets only virtmgr execute AVF's
+# crosvm_exec; so the build has its own exec type and runs in AVF's crosvm domain. The same
+# executable serves `crosvm stop <socket>`, which the service runs to ask the VM to exit.
+type xkernel_crosvm_exec, system_file_type, exec_type, file_type;
+domain_auto_trans(xkernel_vm_service, xkernel_crosvm_exec, crosvm)
+# Killing a crosvm that ignores the stop request; also the parent-death signal.
+allow xkernel_vm_service crosvm:process { sigkill signal };
+
+# crosvm's stdin and stdout are the console pipes, reopened through /proc/self/fd for its serial
+# devices; its stderr is state_dir/crosvm.log, opened by the service.
+allow crosvm xkernel_vm_service:fifo_file open;
+allow crosvm xkernel_vm_data_file:file { getattr append write ioctl };
+
+# It opens the instance's writable disks by path and creates its control socket in state_dir,
+# where the stopping crosvm connects to it.
+allow crosvm xkernel_vm_data_file:dir { search getattr write add_name remove_name };
+allow crosvm xkernel_vm_data_file:file { open read lock map };
+allow crosvm xkernel_vm_data_file:sock_file { create unlink getattr setattr write };
+allow crosvm self:unix_stream_socket { create_stream_socket_perms connectto };
+
+# No vsock for the service itself: platform policy lets only AVF's managers, adbd and traced
+# create or connect vsock sockets (system/sepolicy private/domain.te), so the direct backend's
+# readiness handshake cannot be a vsock connection from this service under enforcing SELinux.

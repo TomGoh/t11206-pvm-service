@@ -1,2 +1,3 @@
 /system_ext/bin/xkernel_vm_service  u:object_r:xkernel_vm_service_exec:s0
 /data/misc/xkernel_vm(/.*)?         u:object_r:xkernel_vm_data_file:s0
+/system_ext/bin/xkernel_crosvm      u:object_r:xkernel_crosvm_exec:s0
