@@ -11,8 +11,8 @@
 //!   "name": "xkernel_vm",
 //!   "kernel": "/system_ext/etc/xkernel_vm/kernel.bin",
 //!   "params": "panic=-1 console=ttyS0 loglevel=8",
-//!   "memory_mib": 128,
-//!   "cpus": 1,
+//!   "memory_mib": 256,
+//!   "cpus": 2,
 //!   "protection": "without_firmware",
 //!   "disks": [
 //!     { "path": "/system_ext/etc/xkernel_vm/dummy.img", "writable": false },
@@ -22,15 +22,16 @@
 //! }
 //! ```
 //!
-//! `protection` says which AVF admission the instance relies on, so the preconditions can name
-//! the hypervisor property it needs and the UI can show the mode. AVF itself decides: an instance
+//! `protection` says how the instance is protected, so the UI can show the mode; through AVF it
+//! also names the hypervisor property the preconditions need. AVF itself decides: an instance
 //! with `"without_firmware"` only runs that way if the product declares it in
 //! `/system_ext/etc/avf/protected_vms_without_firmware*.xml` for this service's executable.
 //!
-//! `backend` says who runs crosvm: `"avf"` (the default) creates the VM through AVF, which needs
-//! the Virtualization module's support for declared firmware-less VMs; `"direct"` runs a crosvm
-//! binary itself, for products that may not change AVF (see `direct`). The direct backend needs a
-//! `direct` section:
+//! `backend` says who runs crosvm: `"direct"` runs a crosvm binary itself and needs no change to
+//! AVF, which makes it the preferred one and the product config's choice (`etc/xkernel_vm.json`);
+//! `"avf"` (`etc/xkernel_vm.avf.json`, and the value when `backend` is left out) creates the VM
+//! through AVF, which needs the Virtualization module's support for declared firmware-less VMs.
+//! The direct backend needs a `direct` section:
 //!
 //! ```json
 //! "backend": "direct",
@@ -386,20 +387,20 @@ mod tests {
         assert_eq!(c.name, "xkernel_vm");
         assert_eq!(c.protection, Protection::WithoutFirmware);
         assert_eq!(c.crosvm_process_name(), "crosvm_xkernel_vm");
-    }
-
-    #[test]
-    fn the_shipped_direct_config_is_valid() {
-        let c = VmConfig::parse(include_str!("../etc/xkernel_vm.direct.json")).unwrap();
         assert_eq!(c.backend, BackendKind::Direct);
         let d = c.direct.as_ref().unwrap();
         assert!(d.cid.is_some_and(|cid| cid < AVF_FIRST_CID));
         assert!(d.kill_after_seconds < c.stop_timeout_seconds);
-        // The same instance as the AVF config, only run differently.
-        let avf = VmConfig::parse(include_str!("../etc/xkernel_vm.json")).unwrap();
+    }
+
+    #[test]
+    fn the_shipped_avf_config_is_the_same_instance() {
+        let c = VmConfig::parse(include_str!("../etc/xkernel_vm.avf.json")).unwrap();
+        assert_eq!(c.backend, BackendKind::Avf);
+        let direct = VmConfig::parse(include_str!("../etc/xkernel_vm.json")).unwrap();
         assert_eq!(
             (c.name, c.memory_mib, c.cpus, c.disks),
-            (avf.name, avf.memory_mib, avf.cpus, avf.disks)
+            (direct.name, direct.memory_mib, direct.cpus, direct.disks)
         );
     }
 

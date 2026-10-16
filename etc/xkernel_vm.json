@@ -12,5 +12,10 @@
   "state_dir": "/data/misc/xkernel_vm",
   "console_input_device": "ttyS0",
   "stop_timeout_seconds": 30,
-  "reclaim_window_seconds": 10
+  "reclaim_window_seconds": 10,
+  "backend": "direct",
+  "direct": {
+    "crosvm": "/system_ext/bin/xkernel_crosvm",
+    "cid": 1024
+  }
 }

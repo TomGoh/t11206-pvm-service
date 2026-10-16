@@ -62,10 +62,7 @@ rust_binary {
     defaults: ["xkernel_vm_service_defaults"],
     system_ext_specific: true,
     init_rc: ["etc/init/xkernel_vm_service.rc"],
-    required: [
-        "xkernel_vm.json",
-        "protected_vms_without_firmware_xkernel.xml",
-    ],
+    required: ["xkernel_vm.json"],
 }
 
 rust_test {
@@ -90,6 +87,8 @@ rust_binary {
     ],
 }
 
+// The instance config: the direct backend (preferred). A product that runs the VM through AVF
+// takes etc/xkernel_vm.avf.json as src instead and adds the declaration below.
 prebuilt_etc {
     name: "xkernel_vm.json",
     src: "etc/xkernel_vm.json",
@@ -97,8 +96,8 @@ prebuilt_etc {
     relative_install_path: "xkernel_vm",
 }
 
-// Read by virtmgr: the x-kernel VM may only be run by /system_ext/bin/xkernel_vm_service, as a
-// protected VM without guest firmware.
+// Read by virtmgr, AVF backend only: the x-kernel VM may only be run by
+// /system_ext/bin/xkernel_vm_service, as a protected VM without guest firmware.
 prebuilt_etc {
     name: "protected_vms_without_firmware_xkernel.xml",
     src: "etc/avf/protected_vms_without_firmware_xkernel.xml",
