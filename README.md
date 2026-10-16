@@ -52,6 +52,7 @@ x-kernel 虚拟机的原生控制服务。它是这台设备上 x-kernel 虚拟�
 | `launcher/` | `xkernel_crosvm_launcher`：进入 `crosvm` 域后重新设置父进程死亡信号，再执行 crosvm。 |
 | `loader/` | `xkernel_vm_loader`：按 `modules.load` 加载模块、准备设备节点、报告结果（逻辑在 `loader.rs`，可在开发机测试）。 |
 | `product.mk` | 产品集成片段。 |
+| `device/t11206/` | 在 T11206 调试平板上不刷机、按产品方式安装（init 拉起、SELinux 生效）的脚本，以及并入系统扩展分区的策略增量 `system_ext_additions.cil`；说明见其 `README.md`。 |
 | `host-tests/` | 在开发机上运行纯逻辑模块的单元测试：`cd host-tests && cargo test`；GitHub 在每次推送和拉取请求时运行它，并检查格式和 clippy（`.github/workflows/host-tests.yml`）。服务本身只能在 Android 源码树里编译，不在 CI 中构建。 |
 
 ## 构建

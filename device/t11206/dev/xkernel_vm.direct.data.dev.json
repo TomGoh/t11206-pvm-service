@@ -1,0 +1,31 @@
+{
+  "name": "xkernel_vm",
+  "kernel": "/data/local/tmp/xkernel-pvm/vm/kernel.bin",
+  "params": "panic=-1 console=ttyS0 loglevel=8",
+  "memory_mib": 256,
+  "cpus": 2,
+  "protection": "without_firmware",
+  "disks": [
+    {
+      "path": "/data/local/tmp/xkernel-pvm/vm/dummy.img",
+      "writable": false
+    },
+    {
+      "path": "/data/misc/xkernel_vm/rootfs.img",
+      "writable": true
+    }
+  ],
+  "state_dir": "/data/misc/xkernel_vm",
+  "console_input_device": "ttyS0",
+  "stop_timeout_seconds": 30,
+  "reclaim_window_seconds": 10,
+  "backend": "direct",
+  "direct": {
+    "crosvm": "/data/local/tmp/xhyper-new/crosvm-xhyper",
+    "cid": 1024
+  },
+  "readiness": {
+    "console_marker": "kylin-x:~#",
+    "timeout_seconds": 60
+  }
+}

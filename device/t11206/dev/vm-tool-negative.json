@@ -1,0 +1,1 @@
+{"name":"xkernel_vm","kernel":"/data/local/tmp/xkernel-pvm/vm/kernel.bin","params":"console=ttyS0","memory_mib":128,"platform_version":"~1.0"}
