@@ -16,6 +16,8 @@
   "backend": "direct",
   "direct": {
     "crosvm": "/system_ext/bin/xkernel_crosvm",
+    "launcher": "/system_ext/bin/xkernel_crosvm_launcher",
     "cid": 1024
-  }
+  },
+  "driver": { "timeout_seconds": 20 }
 }

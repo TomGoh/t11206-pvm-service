@@ -39,12 +39,16 @@ allow { crosvm virtualizationmanager } xkernel_vm_service:fifo_file { getattr io
 
 # The direct backend: the service runs the product's crosvm build with the hypervisor's backend
 # (/system_ext/bin/xkernel_crosvm) itself. Platform policy lets only the crosvm domain open
-# kvm_device (/dev/vhost-vsock) and, among core domains, the VM manager devices (/dev/xhyper once
-# vendor policy gives it a vm_manager_device_type), and lets only virtmgr execute AVF's
-# crosvm_exec; so the build has its own exec type and runs in AVF's crosvm domain. The same
-# executable serves `crosvm stop <socket>`, which the service runs to ask the VM to exit.
+# kvm_device (/dev/vhost-vsock) and lets only virtmgr execute AVF's crosvm_exec, so crosvm runs
+# in AVF's crosvm domain, entered through xkernel_crosvm_launcher. The kernel clears the
+# parent-death signal on that domain change; the launcher arms it again and then executes the
+# crosvm build in the same domain, which keeps it (launcher/main.rs). Both crosvm processes, the
+# VM's and `crosvm stop <socket>`, start this way.
 type xkernel_crosvm_exec, system_file_type, exec_type, file_type;
 domain_auto_trans(xkernel_vm_service, xkernel_crosvm_exec, crosvm)
+type xkernel_crosvm_file, system_file_type, file_type;
+allow crosvm xkernel_crosvm_file:file { rx_file_perms execute_no_trans };
+allow xkernel_vm_service xkernel_crosvm_file:file getattr;
 # Killing a crosvm that ignores the stop request; also the parent-death signal.
 allow xkernel_vm_service crosvm:process { sigkill signal };
 
@@ -68,3 +72,29 @@ allow crosvm self:unix_stream_socket { create_stream_socket_perms connectto };
 # No vsock for the service itself: platform policy lets only AVF's managers, adbd and traced
 # create or connect vsock sockets (system/sepolicy private/domain.te), so the direct backend's
 # readiness handshake cannot be a vsock connection from this service under enforcing SELinux.
+
+# The hypervisor's host driver, loaded on demand (src/driver.rs, loader/). The service writes a
+# request, init starts the loader, the loader writes the result.
+system_internal_prop(xkernel_vm_driver_prop)
+set_prop(xkernel_vm_service, xkernel_vm_driver_prop)
+type xkernel_vm_loader, domain, coredomain;
+type xkernel_vm_loader_exec, system_file_type, exec_type, file_type;
+init_daemon_domain(xkernel_vm_loader)
+set_prop(xkernel_vm_loader, xkernel_vm_driver_prop)
+# The modules and modules.load, in /system_ext/etc/xkernel_vm/modules.
+type xkernel_vm_module_file, system_file_type, file_type;
+allow xkernel_vm_loader xkernel_vm_module_file:dir r_dir_perms;
+allow xkernel_vm_loader xkernel_vm_module_file:file r_file_perms;
+allow xkernel_vm_loader xkernel_vm_module_file:system module_load;
+allow xkernel_vm_loader self:global_capability_class_set { sys_module chown };
+
+# The driver's device node. It ships with this package, not with the vendor partition, so its type
+# and label are here (ueventd labels /dev from every partition's file_contexts) and the loader,
+# not a vendor ueventd rule, gives it its mode: 0666 root root like AOSP's /dev/kvm, with SELinux
+# doing the limiting. It is not a vm_manager_device_type, because platform policy lets no core
+# domain but crosvm and ueventd change those, the loader included; the protection that matters,
+# that only crosvm uses the device, is stated below for this type.
+type xhyper_device, dev_type;
+allow xkernel_vm_loader xhyper_device:chr_file { getattr setattr };
+allow crosvm xhyper_device:chr_file rw_file_perms;
+neverallow { domain -crosvm } xhyper_device:chr_file { open read write ioctl map };

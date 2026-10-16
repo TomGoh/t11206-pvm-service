@@ -2,9 +2,8 @@
 # from boot completion on; it is small and idle while the VM is stopped.
 service xkernel_vm_service /system_ext/bin/xkernel_vm_service
     class main
-    # crosvm runs with this service's identity and opens /dev/xhyper: the vendor's ueventd rule
-    # makes it 0666 like /dev/kvm, and SELinux lets only the crosvm domain open it
-    # (vendor/README.md). No capabilities.
+    # crosvm runs with this service's identity and opens /dev/xhyper, which xkernel_vm_loader
+    # makes 0666 like /dev/kvm; SELinux lets only the crosvm domain open it. No capabilities.
     user system
     group system virtualmachine
     # The hypervisor driver pins the guest's memory against the locked-memory limit (8 MiB by
@@ -14,6 +13,20 @@ service xkernel_vm_service /system_ext/bin/xkernel_vm_service
 
 on post-fs-data
     mkdir /data/misc/xkernel_vm 0770 root system
+
+# Loads the hypervisor's host driver when the service asks: a start that finds /dev/xhyper
+# missing (the first one after boot) writes a new request number (src/driver.rs). The loader
+# loads /system_ext/etc/xkernel_vm/modules in the order of its modules.load, makes /dev/xhyper
+# 0666 root root and writes the result to xkernel_vm.driver_status (loader/main.rs).
+service xkernel_vm_loader /system_ext/bin/xkernel_vm_loader
+    user root
+    group root
+    capabilities SYS_MODULE CHOWN
+    disabled
+    oneshot
+
+on property:xkernel_vm.load_driver=*
+    start xkernel_vm_loader
 
 on property:sys.boot_completed=1
     start xkernel_vm_service

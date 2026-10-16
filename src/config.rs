@@ -103,6 +103,11 @@ pub enum BackendKind {
 pub struct DirectConfig {
     /// The crosvm binary to run: a build with the hypervisor's backend.
     pub crosvm: PathBuf,
+    /// `xkernel_crosvm_launcher`, which starts crosvm so that it dies with this service even
+    /// though it runs in another SELinux domain (see `launcher/main.rs`). Without one crosvm is
+    /// started directly; then only a start without a domain change keeps that guarantee.
+    #[serde(default)]
+    pub launcher: Option<PathBuf>,
     /// The vsock CID. It must stay below [`AVF_FIRST_CID`] so it never collides with a VM AVF
     /// runs. Without one the VM has no vsock device and no readiness handshake.
     #[serde(default)]
@@ -176,7 +181,8 @@ pub struct VmConfig {
     pub disks: Vec<DiskConfig>,
     /// Where the service keeps the instance ID and the record of running processes.
     pub state_dir: PathBuf,
-    /// The hypervisor driver's device node; its absence makes the instance unavailable.
+    /// The hypervisor driver's device node; its absence makes the instance unavailable, unless
+    /// `driver` says to load the driver on a start.
     #[serde(default = "default_hypervisor_device")]
     pub hypervisor_device: PathBuf,
     /// Serial device for console input, `"hvc0"` (AVF's default) or `"ttyS0"`.
@@ -196,6 +202,23 @@ pub struct VmConfig {
     /// Required with `"backend": "direct"`, refused otherwise.
     #[serde(default)]
     pub direct: Option<DirectConfig>,
+    /// Load the hypervisor's host driver on a start when its device node is missing (see
+    /// `driver.rs`); without this a missing node makes the instance unavailable.
+    #[serde(default)]
+    pub driver: Option<DriverConfig>,
+}
+
+/// Loading the hypervisor driver on demand.
+#[derive(Clone, Debug, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct DriverConfig {
+    /// How long a start waits for the loader to report.
+    #[serde(default = "default_driver_timeout")]
+    pub timeout_seconds: u64,
+}
+
+fn default_driver_timeout() -> u64 {
+    20
 }
 
 fn default_hypervisor_device() -> PathBuf {
@@ -205,7 +228,7 @@ fn default_hypervisor_device() -> PathBuf {
 /// Whether `path` exists, asked with `access(F_OK)` instead of `stat`: platform policy forbids
 /// this service, a core domain, even `getattr` on a VM manager device such as /dev/xhyper (only
 /// crosvm may touch one), and the kernel asks SELinux nothing for an `F_OK` check.
-fn exists_without_stat(path: &Path) -> bool {
+pub fn exists_without_stat(path: &Path) -> bool {
     use std::os::unix::ffi::OsStrExt;
     let Ok(path) = std::ffi::CString::new(path.as_os_str().as_bytes()) else {
         return false;
@@ -273,6 +296,9 @@ impl VmConfig {
             ensure!(readiness.timeout_seconds > 0, "readiness.timeout_seconds must be positive");
         }
         ensure!(self.stop_timeout_seconds > 0, "stop_timeout_seconds must be positive");
+        if let Some(driver) = &self.driver {
+            ensure!(driver.timeout_seconds > 0, "driver.timeout_seconds must be positive");
+        }
         ensure!(self.reclaim_window_seconds > 0, "reclaim_window_seconds must be positive");
         match (self.backend, &self.direct) {
             (BackendKind::Avf, None) => {}
@@ -280,6 +306,9 @@ impl VmConfig {
             (BackendKind::Direct, None) => bail!("\"backend\": \"direct\" needs a direct section"),
             (BackendKind::Direct, Some(direct)) => {
                 ensure!(direct.crosvm.is_absolute(), "direct.crosvm must be an absolute path");
+                if let Some(launcher) = &direct.launcher {
+                    ensure!(launcher.is_absolute(), "direct.launcher must be an absolute path");
+                }
                 ensure!(
                     self.protection != Protection::WithFirmware,
                     "the direct backend runs no guest firmware"
@@ -313,7 +342,7 @@ impl VmConfig {
         virtmgr: &Path,
         property: &dyn Fn(&str) -> Option<String>,
     ) -> Result<(), String> {
-        if !exists_without_stat(&self.hypervisor_device) {
+        if self.driver.is_none() && !exists_without_stat(&self.hypervisor_device) {
             return Err(format!(
                 "hypervisor driver missing: {} does not exist",
                 self.hypervisor_device.display()
@@ -330,13 +359,12 @@ impl VmConfig {
                 }
             }
             Some(direct) => {
-                let executable = fs::metadata(&direct.crosvm)
-                    .is_ok_and(|m| m.is_file() && m.permissions().mode() & 0o111 != 0);
-                if !executable {
-                    return Err(format!(
-                        "crosvm missing: {} is not executable",
-                        direct.crosvm.display()
-                    ));
+                for program in std::iter::once(&direct.crosvm).chain(&direct.launcher) {
+                    let executable = fs::metadata(program)
+                        .is_ok_and(|m| m.is_file() && m.permissions().mode() & 0o111 != 0);
+                    if !executable {
+                        return Err(format!("{} is not executable", program.display()));
+                    }
                 }
             }
         }
@@ -471,12 +499,56 @@ mod tests {
         }
         let no_props = props(&[]);
         let check = || c.preflight(&dir.join("no-virtmgr"), &no_props);
-        assert!(check().unwrap_err().contains("crosvm missing"));
+        assert!(check().unwrap_err().contains("crosvm is not executable"));
         fs::write(dir.join("crosvm"), b"#!/bin/sh\n").unwrap();
         assert!(check().unwrap_err().contains("not executable"));
         fs::set_permissions(dir.join("crosvm"), fs::Permissions::from_mode(0o755)).unwrap();
         // Neither virtmgr nor the AVF property is needed.
         assert_eq!(check(), Ok(()));
+
+        // A configured launcher must be there too.
+        let launched = VmConfig::parse(&json.replace(
+            r#"/crosvm" }"#,
+            &format!(r#"/crosvm", "launcher": "{}/launcher" }}"#, dir.display()),
+        ))
+        .unwrap();
+        let check = || launched.preflight(&dir.join("no-virtmgr"), &no_props);
+        assert!(check().unwrap_err().contains("launcher is not executable"));
+        fs::write(dir.join("launcher"), b"#!/bin/sh\n").unwrap();
+        fs::set_permissions(dir.join("launcher"), fs::Permissions::from_mode(0o755)).unwrap();
+        assert_eq!(check(), Ok(()));
+        fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn a_missing_driver_is_loaded_on_start_only_when_configured() {
+        let dir = std::env::temp_dir().join(format!("xkvm-config-driver-{}", std::process::id()));
+        fs::create_dir_all(&dir).unwrap();
+        for f in ["kernel.bin", "dummy.img", "crosvm"] {
+            fs::write(dir.join(f), b"x").unwrap();
+        }
+        fs::set_permissions(dir.join("crosvm"), fs::Permissions::from_mode(0o755)).unwrap();
+        let json = example(&dir).replace(
+            r#""state_dir""#,
+            &format!(
+                r#""backend": "direct", "direct": {{ "crosvm": "{}/crosvm" }}, "state_dir""#,
+                dir.display()
+            ),
+        );
+        let no_props = props(&[]);
+        let without = VmConfig::parse(&json).unwrap();
+        let err = without.preflight(&dir.join("no-virtmgr"), &no_props).unwrap_err();
+        assert!(err.contains("hypervisor driver missing"), "{err}");
+        let with = VmConfig::parse(
+            &json.replace(r#""state_dir""#, r#""driver": { "timeout_seconds": 5 }, "state_dir""#),
+        )
+        .unwrap();
+        assert_eq!(with.driver, Some(DriverConfig { timeout_seconds: 5 }));
+        assert_eq!(with.preflight(&dir.join("no-virtmgr"), &no_props), Ok(()));
+        assert!(VmConfig::parse(
+            &json.replace(r#""state_dir""#, r#""driver": { "timeout_seconds": 0 }, "state_dir""#,)
+        )
+        .is_err());
         fs::remove_dir_all(&dir).unwrap();
     }
 

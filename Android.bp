@@ -62,7 +62,50 @@ rust_binary {
     defaults: ["xkernel_vm_service_defaults"],
     system_ext_specific: true,
     init_rc: ["etc/init/xkernel_vm_service.rc"],
-    required: ["xkernel_vm.json"],
+    required: [
+        "xkernel_crosvm_launcher",
+        "xkernel_vm.json",
+        "xkernel_vm_loader",
+        "xkernel_vm_modules.load",
+    ],
+}
+
+// Starts the direct backend's crosvm so that it dies with the service (launcher/main.rs).
+rust_binary {
+    name: "xkernel_crosvm_launcher",
+    crate_name: "xkernel_crosvm_launcher",
+    srcs: ["launcher/main.rs"],
+    edition: "2021",
+    prefer_rlib: true,
+    system_ext_specific: true,
+    rustlibs: ["liblibc"],
+}
+
+// Loads the hypervisor's host driver when the service asks (loader/main.rs).
+rust_binary {
+    name: "xkernel_vm_loader",
+    crate_name: "xkernel_vm_loader",
+    srcs: ["loader/main.rs"],
+    edition: "2021",
+    prefer_rlib: true,
+    system_ext_specific: true,
+    rustlibs: [
+        "libandroid_logger",
+        "liblibc",
+        "liblog_rust",
+        "librustutils",
+    ],
+}
+
+// The load order of the driver's modules. The .ko files themselves come with the driver build
+// (they must match the device's kernel) and go into the same directory,
+// /system_ext/etc/xkernel_vm/modules.
+prebuilt_etc {
+    name: "xkernel_vm_modules.load",
+    src: "etc/modules.load",
+    filename: "modules.load",
+    system_ext_specific: true,
+    relative_install_path: "xkernel_vm/modules",
 }
 
 rust_test {

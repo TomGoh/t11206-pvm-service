@@ -1,0 +1,10 @@
+# The hypervisor's host driver, in dependency order (xkernel_vm_loader loads them one by one; a
+# module already loaded is skipped). The .ko files come with the driver build and sit beside this
+# file in /system_ext/etc/xkernel_vm/modules.
+xhyper_hypercall.ko
+xhyper.ko
+xhyper_platform_hooks.ko
+xhyper_rsc_mgr.ko
+xhyper_vcpu.ko
+xhyper_irqfd.ko
+xhyper_ioeventfd.ko

@@ -124,7 +124,7 @@ impl Process {
 
 pub struct DirectInstance {
     process: Arc<Process>,
-    crosvm: PathBuf,
+    direct: DirectConfig,
     socket: PathBuf,
     cid: Option<u32>,
     kill_after: Duration,
@@ -266,9 +266,8 @@ impl Backend for DirectBackend {
 
         let console =
             self.console.begin(generation).map_err(|e| format!("can't open the console: {e}"))?;
-        let mut command = Command::new(&self.direct.crosvm);
+        let mut command = crosvm_command(&self.direct, &self.config.crosvm_process_name());
         command
-            .arg0(self.config.crosvm_process_name())
             .args(&args)
             .stdin(Stdio::from(console.input))
             .stdout(Stdio::from(console.output))
@@ -302,7 +301,7 @@ impl Backend for DirectBackend {
         }
         Ok(DirectInstance {
             process,
-            crosvm: self.direct.crosvm.clone(),
+            direct: self.direct.clone(),
             socket,
             cid: self.direct.cid,
             kill_after: Duration::from_secs(self.direct.kill_after_seconds),
@@ -332,9 +331,27 @@ fn set_parent_death_signal(command: &mut Command) {
 #[cfg(not(any(target_os = "linux", target_os = "android")))]
 fn set_parent_death_signal(_command: &mut Command) {}
 
-/// Runs `crosvm stop SOCKET` and returns whether crosvm accepted it.
-fn request_stop(crosvm: &Path, socket: &Path) -> Result<(), String> {
-    let mut child = Command::new(crosvm)
+/// The command that runs crosvm with `argv0` as argv[0]: through the launcher when one is
+/// configured, so it dies with this service even in another SELinux domain.
+fn crosvm_command(direct: &DirectConfig, argv0: &str) -> Command {
+    match &direct.launcher {
+        Some(launcher) => {
+            let mut command = Command::new(launcher);
+            command.arg(std::process::id().to_string()).arg(&direct.crosvm).arg(argv0);
+            command
+        }
+        None => {
+            let mut command = Command::new(&direct.crosvm);
+            command.arg0(argv0);
+            command
+        }
+    }
+}
+
+/// Runs `crosvm stop SOCKET` and returns whether crosvm accepted it. It goes through the
+/// launcher too, so the stopping crosvm runs in the same domain as the VM's.
+fn request_stop(direct: &DirectConfig, socket: &Path) -> Result<(), String> {
+    let mut child = crosvm_command(direct, "crosvm")
         .arg("--no-syslog")
         .arg("stop")
         .arg(socket)
@@ -365,7 +382,7 @@ impl Instance for DirectInstance {
     }
 
     fn stop(&self) -> Result<(), String> {
-        match request_stop(&self.crosvm, &self.socket) {
+        match request_stop(&self.direct, &self.socket) {
             Ok(()) => {
                 let process = self.process.clone();
                 let kill_after = self.kill_after;

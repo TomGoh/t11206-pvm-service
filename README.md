@@ -18,10 +18,16 @@ x-kernel 虚拟机的原生控制服务。它是这台设备上 x-kernel 虚拟�
 
 实例配置的 `backend` 决定由谁运行 crosvm，状态机、回收核实、控制台、Binder 接口、命令行工具和应用对两者完全相同：
 
-- `direct`（首选，产品配置 `etc/xkernel_vm.json`）：不改 AVF：添加本服务、控制应用和 crosvm 预编译文件即可，另需厂商侧给 `/dev/xhyper` 配标签和权限（`vendor/`）。服务自己运行一个带虚拟化层后端的 crosvm（`direct.crosvm`），不经 virtmgr，不需要 AVF 声明文件和 AVF 能力属性。命令行与 virtmgr 为这个实例生成的相同（平板实测），只去掉 AVF 独有的设备树覆盖层，日志和故障管道改接空设备，vsock CID 由配置给出并低于 AVF 的分配范围。crosvm 是服务的子进程，进程名同样是 `crosvm_<name>`，在 AVF 的 `crosvm` 安全域里运行；服务死亡时由 init 结束服务的整个进程组，crosvm 随之结束（父进程死亡信号会被安全域切换清除，只在不切换域时起作用）。停止时先经 crosvm 的控制套接字请求退出，失败或超过 `kill_after_seconds` 仍未退出就强制结束。crosvm 自己的日志写到 `state_dir/crosvm.log`。状态里的 `viaAvf` 表明当前是哪一种。
+- `direct`（首选，产品配置 `etc/xkernel_vm.json`）：不改 AVF，也不改厂商分区：添加本服务、控制应用、crosvm 预编译文件和宿主驱动的模块文件即可，全部在 system_ext 分区。服务自己运行一个带虚拟化层后端的 crosvm（`direct.crosvm`），不经 virtmgr，不需要 AVF 声明文件和 AVF 能力属性。命令行与 virtmgr 为这个实例生成的相同（平板实测），只去掉 AVF 独有的设备树覆盖层，日志和故障管道改接空设备，vsock CID 由配置给出并低于 AVF 的分配范围。crosvm 是服务的子进程，进程名同样是 `crosvm_<name>`，在 AVF 的 `crosvm` 安全域里运行，经 `xkernel_crosvm_launcher` 启动：内核在切换安全域时清除父进程死亡信号，启动器进入 `crosvm` 域后重新设置它，再在同一个域里执行 crosvm，所以服务死亡时 crosvm 随之结束（不论服务是否由 init 启动）。停止时先经 crosvm 的控制套接字请求退出，失败或超过 `kill_after_seconds` 仍未退出就强制结束。crosvm 自己的日志写到 `state_dir/crosvm.log`。状态里的 `viaAvf` 表明当前是哪一种。
 - `avf`（配置 `etc/xkernel_vm.avf.json`；配置里不写 `backend` 时也按它处理）：经 AVF 创建，需要 Virtualization 模块的配套改动（见下节）。产品改用它时，把 `xkernel_vm.json` 模块的源文件换成这份配置，并把 `protected_vms_without_firmware_xkernel.xml` 加进 `PRODUCT_PACKAGES`。
 
-两者共用的依赖（`/dev/xhyper` 的厂商侧标签与权限、可写磁盘的位置、SELinux）先按直接后端解决，结论同样用于经 AVF 的路径。
+两者共用的依赖（宿主驱动的加载与设备节点、可写磁盘的位置、SELinux）先按直接后端解决，结论同样用于经 AVF 的路径。
+
+## 宿主驱动按需加载
+
+开机时不加载宿主驱动，设备在有人启动虚拟机之前与原来一样。配置里有 `driver` 时，启动发现 `/dev/xhyper` 不存在（开机后的第一次启动），服务就向属性 `xkernel_vm.load_driver` 写入一个新的请求号；init 脚本据此启动 `xkernel_vm_loader`，它按 `/system_ext/etc/xkernel_vm/modules/modules.load` 的顺序加载同一目录里的模块（已加载的跳过），等到设备节点出现，设为 0666 root root（与 AOSP 的 `/dev/kvm` 相同，由 SELinux 限定只有 crosvm 域能打开），再把 `loaded <请求号>` 或 `failed <请求号>: <原因>` 写到 `xkernel_vm.driver_status`；服务等到这个结果再启动虚拟机，超过 `driver.timeout_seconds` 算失败。服务自己不加载模块：平台策略只把加载模块的权限给专门的域，回答应用请求的服务不应持有它。
+
+模块文件（`.ko`）要与设备的内核一致，随宿主驱动的构建交付，由产品放进 `/system_ext/etc/xkernel_vm/modules/`；本仓库只带加载顺序 `etc/modules.load`。设备节点的类型 `xhyper_device` 和标签也在本仓库的 system_ext 策略里，因为驱动随本包交付，而不是随厂商分区。若产品改由厂商分区交付驱动（例如 vendor_dlkm），类型、标签和权限就应改由厂商策略和厂商的 ueventd 规则给出。
 
 ## 经 AVF 时
 
@@ -41,8 +47,10 @@ x-kernel 虚拟机的原生控制服务。它是这台设备上 x-kernel 虚拟�
 | `src/service.rs` | `IXKernelVmControl` 的 Binder 实现与调用方校验。 |
 | `ctl/main.rs` | 命令行客户端 `xkernel_vmctl status|start|stop|watch|console`。 |
 | `etc/` | 实例配置（`xkernel_vm.json` 为直接后端，`xkernel_vm.avf.json` 为经 AVF）、AVF 声明、init 脚本。 |
-| `sepolicy/` | system_ext 策略：服务的域、接口、数据目录，直接后端的 crosvm 可执行文件类型及其转入 `crosvm` 域的规则。 |
-| `vendor/` | 厂商分区要带的 `/dev/xhyper` 类型、标签（`sepolicy/`）和权限（`ueventd.rc`），说明见 `vendor/README.md`。 |
+| `sepolicy/` | system_ext 策略：服务的域、接口、数据目录；启动器转入 `crosvm` 域、crosvm 程序本身的类型；加载程序的域、模块文件、驱动属性；设备节点 `xhyper_device`（只有 crosvm 域能打开）。 |
+| `src/driver.rs` | 按需加载宿主驱动：请求、等待结果。 |
+| `launcher/` | `xkernel_crosvm_launcher`：进入 `crosvm` 域后重新设置父进程死亡信号，再执行 crosvm。 |
+| `loader/` | `xkernel_vm_loader`：按 `modules.load` 加载模块、准备设备节点、报告结果（逻辑在 `loader.rs`，可在开发机测试）。 |
 | `product.mk` | 产品集成片段。 |
 | `host-tests/` | 在开发机上运行纯逻辑模块的单元测试：`cd host-tests && cargo test`；GitHub 在每次推送和拉取请求时运行它，并检查格式和 clippy（`.github/workflows/host-tests.yml`）。服务本身只能在 Android 源码树里编译，不在 CI 中构建。 |
 
@@ -54,8 +62,8 @@ x-kernel 虚拟机的原生控制服务。它是这台设备上 x-kernel 虚拟�
 
 - 经 AVF 时，能力属性目前没有来源：虚拟化层的资源管理器还不计算它，开发验证时由 root 设置一次。直接后端不用它。
 - 经 AVF 时，AVF 对受保护虚拟机的磁盘镜像有 SELinux 标签检查；放在 `/data/misc/xkernel_vm` 的可写 rootfs 不在允许列表内，正式布局待定。
-- 服务以 `system` 用户运行，没有特权；宿主驱动按可锁定内存上限固定客户机内存，所以 init 脚本把上限设为不限（`rlimit memlock`）。经 AVF 的方式在非 root 下还没有验证过。
-- SELinux：策略经平台 neverallow 编译检查；2026-10-16 在平板上运行时加载平板策略加本策略和 `vendor/` 的类型，宽容模式下服务和 crosvm 没有一次访问被拒绝。还没有在强制模式、也没有由 init 启动的服务上验证。
+- 服务以 `system` 用户运行，没有特权；宿主驱动按可锁定内存上限固定客户机内存，所以 init 脚本把上限设为不限（`rlimit memlock`）。经 AVF 的方式在非 root 下还没有验证过。加载程序以 root 运行，只有加载模块和改设备节点属主的特权。
+- SELinux：策略经平台 neverallow 编译检查；2026-10-16 在平板上运行时加载平板策略加本策略，宽容模式下服务和 crosvm 没有一次访问被拒绝（启动器与按需加载另见实施记录）。还没有在强制模式、也没有由 init 启动的服务上验证。
 - 没有就绪握手配置时实例不会显示为“服务可用”；x-kernel 侧的握手端口待定。
 - 无固件模式不经固件认证镜像，也不传递 DICE 身份；宿主复位时不清理该虚拟机内存（与带固件路径不同）。
-- 直接后端：crosvm 二进制要由产品另行安装（示例配置假定在 `/system_ext/bin/xkernel_crosvm`），本仓库不带这个预编译文件；平台策略只允许 AVF 的 `crosvm` 域打开 `/dev/vhost-vsock` 和虚拟机管理设备，所以 crosvm 由服务转入这个域运行；服务的就绪握手不能用服务自己发起的 vsock 连接（平台策略只允许 AVF 的管理进程、adbd 和 traced 用 vsock）；服务不经 init 启动又被杀死时 crosvm 会留下，重启后的服务只报告“回收待核实”，不会替它结束进程；这个 crosvm 版本在 vCPU 出错后也以 33 退出，结束原因会被记成“客户机关机”。
+- 直接后端：crosvm 二进制要由产品另行安装（示例配置假定在 `/system_ext/bin/xkernel_crosvm`），本仓库不带这个预编译文件；平台策略只允许 AVF 的 `crosvm` 域打开 `/dev/vhost-vsock` 和虚拟机管理设备，所以 crosvm 由服务转入这个域运行；服务的就绪握手不能用服务自己发起的 vsock 连接（平台策略只允许 AVF 的管理进程、adbd 和 traced 用 vsock）；配置里没有 `launcher` 时，crosvm 直接由服务启动，转入 `crosvm` 域后父进程死亡信号被清除，服务被杀死后只有 init 结束进程组这一层保护；这个 crosvm 版本在 vCPU 出错后也以 33 退出，结束原因会被记成“客户机关机”。

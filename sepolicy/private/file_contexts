@@ -1,3 +1,7 @@
 /system_ext/bin/xkernel_vm_service  u:object_r:xkernel_vm_service_exec:s0
 /data/misc/xkernel_vm(/.*)?         u:object_r:xkernel_vm_data_file:s0
-/system_ext/bin/xkernel_crosvm      u:object_r:xkernel_crosvm_exec:s0
+/system_ext/bin/xkernel_crosvm_launcher   u:object_r:xkernel_crosvm_exec:s0
+/system_ext/bin/xkernel_crosvm            u:object_r:xkernel_crosvm_file:s0
+/system_ext/bin/xkernel_vm_loader         u:object_r:xkernel_vm_loader_exec:s0
+/system_ext/etc/xkernel_vm/modules(/.*)?  u:object_r:xkernel_vm_module_file:s0
+/dev/xhyper                               u:object_r:xhyper_device:s0

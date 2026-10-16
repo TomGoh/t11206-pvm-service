@@ -24,5 +24,6 @@ jobs:
         with:
           workspaces: host-tests
       - run: cargo fmt --check
-      - run: cargo clippy --all-targets -- -D warnings
+      # As the Android build: warnings are errors and every unsafe block says why it is sound.
+      - run: cargo clippy --all-targets -- -D warnings -D clippy::undocumented_unsafe_blocks
       - run: cargo test

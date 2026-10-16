@@ -26,6 +26,7 @@ mod config;
 mod console;
 mod controller;
 mod direct;
+mod driver;
 mod machine;
 mod reclaim;
 mod service;
@@ -35,6 +36,7 @@ use crate::config::{BackendKind, VmConfig, VIRTMGR_PATH};
 use crate::console::Console;
 use crate::controller::{Backend, Controller, Settings};
 use crate::direct::DirectBackend;
+use crate::driver::{DriverLoader, WithDriver};
 use crate::service::{Callbacks, ConsoleClients, ControlService, SERVICE_NAME};
 use anyhow::{Context, Result};
 use binder::{BinderFeatures, ProcessState};
@@ -76,16 +78,25 @@ fn try_main() -> Result<()> {
     info!("instance config {}: {config:?}", args.config.display());
 
     let console = Console::new();
+    // Loads the hypervisor driver on a start that finds its device node missing.
+    let driver = config.driver.as_ref().map(|d| {
+        DriverLoader::new(
+            config.hypervisor_device.clone(),
+            Duration::from_secs(d.timeout_seconds),
+            Box::new(|name, value| system_properties::write(name, value).map_err(|e| format!("{e:#}"))),
+            Box::new(|name| system_properties::read(name).ok().flatten()),
+        )
+    });
     match config.backend {
         BackendKind::Avf => {
             let backend = AvfBackend::new(config.clone(), console.clone())
                 .context("Can't prepare the AVF backend")?;
-            serve(config, backend, console)
+            serve(config, WithDriver::new(backend, driver), console)
         }
         BackendKind::Direct => {
             let backend = DirectBackend::new(config.clone(), console.clone())
                 .context("Can't prepare the direct backend")?;
-            serve(config, backend, console)
+            serve(config, WithDriver::new(backend, driver), console)
         }
     }
 }

@@ -1,4 +1,0 @@
-# The hypervisor host driver's device node. Platform policy lets the crosvm domain open every
-# vm_manager_device_type and no other core domain, so AVF's crosvm and the control service's
-# direct-backend crosvm (both in that domain) can use it and nothing else on the system side can.
-type xhyper_device, dev_type, vm_manager_device_type;

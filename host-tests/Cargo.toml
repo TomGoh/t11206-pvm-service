@@ -5,9 +5,14 @@ edition = "2021"
 publish = false
 
 # Runs the unit tests of the service modules that do not need Android (the lifecycle machine,
-# the instance config, the reclaim check, the console and the controller with a fake AVF) on a
+# the instance config, the reclaim check, the console, the controller with a fake AVF, the direct
+# backend with a fake crosvm, the on-demand driver load and the driver loader's logic) on a
 # development host: `cargo test` in this directory. The Android build compiles the same files from
-# ../src/main.rs.
+# ../src/main.rs and ../loader/main.rs. The crosvm launcher is built as is (tests/launcher.rs).
+
+[[bin]]
+name = "xkernel_crosvm_launcher"
+path = "../launcher/main.rs"
 
 [dependencies]
 anyhow = "1"

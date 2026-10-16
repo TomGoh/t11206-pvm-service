@@ -6,6 +6,10 @@ pub mod console;
 pub mod controller;
 #[path = "../../src/direct.rs"]
 pub mod direct;
+#[path = "../../src/driver.rs"]
+pub mod driver;
+#[path = "../../loader/loader.rs"]
+pub mod loader;
 #[path = "../../src/machine.rs"]
 pub mod machine;
 #[path = "../../src/reclaim.rs"]

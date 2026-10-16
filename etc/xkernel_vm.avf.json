@@ -13,5 +13,6 @@
   "console_input_device": "ttyS0",
   "stop_timeout_seconds": 30,
   "reclaim_window_seconds": 10,
-  "backend": "avf"
+  "backend": "avf",
+  "driver": { "timeout_seconds": 20 }
 }
