@@ -27,6 +27,10 @@ allow xkernel_vm_service xkernel_vm_data_file:file create_file_perms;
 # The reclaim check reads /proc/<pid>/{cmdline,stat} of the VM's crosvm.
 r_dir_file(xkernel_vm_service, crosvm)
 r_dir_file(xkernel_vm_service, virtualizationmanager)
+# To find a crosvm_<name> process it scans every /proc entry. A crosvm only ever runs in the crosvm
+# domain, readable above, so the scan skips other domains' entries; this keeps it out of the log.
+dontaudit xkernel_vm_service domain:dir search;
+dontaudit xkernel_vm_service domain:file { read open getattr };
 
 # The serial console: the service creates the pipes and passes the guest ends to its virtmgr,
 # which hands them to crosvm (as AVF's own clients such as CompOS do).
@@ -47,6 +51,9 @@ allow xkernel_vm_service crosvm:process { sigkill signal };
 # crosvm's stdin and stdout are the console pipes, reopened through /proc/self/fd for its serial
 # devices; its stderr is state_dir/crosvm.log, opened by the service.
 allow crosvm xkernel_vm_service:fifo_file open;
+# Asking whether stdin is a terminal (TCGETS2) only ever answers "no" on a pipe; any other ioctl on
+# the pipes stays refused (domain.te already limits them to FIOCLEX and FIONCLEX).
+allowxperm crosvm xkernel_vm_service:fifo_file ioctl 0x542a;
 allow crosvm xkernel_vm_data_file:file { getattr append write ioctl };
 
 # It opens the instance's writable disks by path and creates its control socket in state_dir,
@@ -54,6 +61,8 @@ allow crosvm xkernel_vm_data_file:file { getattr append write ioctl };
 allow crosvm xkernel_vm_data_file:dir { search getattr write add_name remove_name };
 allow crosvm xkernel_vm_data_file:file { open read lock map };
 allow crosvm xkernel_vm_data_file:sock_file { create unlink getattr setattr write };
+# Before a start the service removes the socket a crashed crosvm may have left.
+allow xkernel_vm_service xkernel_vm_data_file:sock_file { getattr unlink };
 allow crosvm self:unix_stream_socket { create_stream_socket_perms connectto };
 
 # No vsock for the service itself: platform policy lets only AVF's managers, adbd and traced

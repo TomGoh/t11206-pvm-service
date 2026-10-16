@@ -2,10 +2,14 @@
 # from boot completion on; it is small and idle while the VM is stopped.
 service xkernel_vm_service /system_ext/bin/xkernel_vm_service
     class main
-    # /dev/xhyper is root-only; crosvm runs with this service's identity.
-    user root
+    # crosvm runs with this service's identity and opens /dev/xhyper: the vendor's ueventd rule
+    # makes it 0666 like /dev/kvm, and SELinux lets only the crosvm domain open it
+    # (vendor/README.md). No capabilities.
+    user system
     group system virtualmachine
-    capabilities IPC_LOCK NET_BIND_SERVICE SYS_RESOURCE SYS_NICE
+    # The hypervisor driver pins the guest's memory against the locked-memory limit (8 MiB by
+    # default; a 256 MiB guest then fails at its first run). crosvm inherits this one.
+    rlimit memlock unlimited unlimited
     disabled
 
 on post-fs-data

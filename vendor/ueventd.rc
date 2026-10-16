@@ -1,0 +1,4 @@
+# The hypervisor host driver's device node, like /dev/kvm and /dev/vhost-vsock in AOSP's
+# ueventd.rc: open to every user, because crosvm runs as whoever starts it (an app through AVF, the
+# control service as system); SELinux (xhyper_device, vendor/sepolicy) lets only crosvm open it.
+/dev/xhyper    0666    root    root

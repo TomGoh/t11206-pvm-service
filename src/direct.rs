@@ -14,10 +14,14 @@
 //! CID is configured, below AVF's range).
 //!
 //! The process: crosvm is a child of this service, with argv[0] `crosvm_<name>` as under AVF, so
-//! the reclaim check finds it the same way. Its parent-death signal is SIGKILL, so it dies with
-//! this service as AVF's VM dies with its virtualization manager. That signal follows the thread
-//! that forked, so crosvm is only ever started from the controller's executor thread, which lives
-//! as long as the service. Killing and reaping the child happen under one lock, so a kill never
+//! the reclaim check finds it the same way. When this service dies its VM must die too, as AVF's
+//! VM dies with its virtualization manager. On a product init does that: it kills the process
+//! group of a service that exits, crosvm included. The parent-death signal (SIGKILL) covers a
+//! service started some other way, but the kernel clears it when SELinux moves the exec into
+//! another domain, so under the product policy (crosvm runs in the crosvm domain) it only holds
+//! without that transition (tablet trial, 2026-10-16). That signal follows the thread that
+//! forked, so crosvm is only ever started from the controller's executor thread, which lives as
+//! long as the service. Killing and reaping the child happen under one lock, so a kill never
 //! reaches a reused PID.
 //!
 //! The console: crosvm's stdin and stdout are the guest ends of the console pipes, and its serial
@@ -219,7 +223,9 @@ pub fn crosvm_args(config: &VmConfig, direct: &DirectConfig, socket: &Path) -> V
 /// the VM stopped (a guest power-off, or `crosvm stop`), 32 when the guest reset (x-kernel resets
 /// on panic with `panic=-1`), 34 when crosvm crashed, 35 on a guest panic, 36 on bad arguments and
 /// 37 on a watchdog reset. A signal is a kill: what an escalated stop does, and also an outside
-/// kill; the machine treats it as a failure only when no stop was asked for.
+/// kill; the machine treats it as a failure only when no stop was asked for. FIXME: the
+/// crosvm-xhyper build in use exited 33 after a vCPU error it logged as "exiting with crash"
+/// (tablet, 2026-10-16), so a stop without a request may hide a crash; crosvm.log tells.
 pub fn exit_of(status: ExitStatus) -> Exit {
     if status.signal().is_some() {
         return Exit::Killed;

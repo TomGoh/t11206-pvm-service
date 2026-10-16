@@ -18,7 +18,7 @@ x-kernel 虚拟机的原生控制服务。它是这台设备上 x-kernel 虚拟�
 
 实例配置的 `backend` 决定由谁运行 crosvm，状态机、回收核实、控制台、Binder 接口、命令行工具和应用对两者完全相同：
 
-- `direct`（首选，产品配置 `etc/xkernel_vm.json`）：不改 AVF：添加本服务、控制应用和 crosvm 预编译文件即可，另需厂商侧给 `/dev/xhyper` 配标签和权限（`sepolicy/vendor/README.md`）。服务自己运行一个带虚拟化层后端的 crosvm（`direct.crosvm`），不经 virtmgr，不需要 AVF 声明文件和 AVF 能力属性。命令行与 virtmgr 为这个实例生成的相同（平板实测），只去掉 AVF 独有的设备树覆盖层，日志和故障管道改接空设备，vsock CID 由配置给出并低于 AVF 的分配范围。crosvm 是服务的子进程，进程名同样是 `crosvm_<name>`；它的父进程死亡信号是 SIGKILL，服务死亡时随之结束。停止时先经 crosvm 的控制套接字请求退出，失败或超过 `kill_after_seconds` 仍未退出就强制结束。crosvm 自己的日志写到 `state_dir/crosvm.log`。状态里的 `viaAvf` 表明当前是哪一种。
+- `direct`（首选，产品配置 `etc/xkernel_vm.json`）：不改 AVF：添加本服务、控制应用和 crosvm 预编译文件即可，另需厂商侧给 `/dev/xhyper` 配标签和权限（`vendor/`）。服务自己运行一个带虚拟化层后端的 crosvm（`direct.crosvm`），不经 virtmgr，不需要 AVF 声明文件和 AVF 能力属性。命令行与 virtmgr 为这个实例生成的相同（平板实测），只去掉 AVF 独有的设备树覆盖层，日志和故障管道改接空设备，vsock CID 由配置给出并低于 AVF 的分配范围。crosvm 是服务的子进程，进程名同样是 `crosvm_<name>`，在 AVF 的 `crosvm` 安全域里运行；服务死亡时由 init 结束服务的整个进程组，crosvm 随之结束（父进程死亡信号会被安全域切换清除，只在不切换域时起作用）。停止时先经 crosvm 的控制套接字请求退出，失败或超过 `kill_after_seconds` 仍未退出就强制结束。crosvm 自己的日志写到 `state_dir/crosvm.log`。状态里的 `viaAvf` 表明当前是哪一种。
 - `avf`（配置 `etc/xkernel_vm.avf.json`；配置里不写 `backend` 时也按它处理）：经 AVF 创建，需要 Virtualization 模块的配套改动（见下节）。产品改用它时，把 `xkernel_vm.json` 模块的源文件换成这份配置，并把 `protected_vms_without_firmware_xkernel.xml` 加进 `PRODUCT_PACKAGES`。
 
 两者共用的依赖（`/dev/xhyper` 的厂商侧标签与权限、可写磁盘的位置、SELinux）先按直接后端解决，结论同样用于经 AVF 的路径。
@@ -41,7 +41,8 @@ x-kernel 虚拟机的原生控制服务。它是这台设备上 x-kernel 虚拟�
 | `src/service.rs` | `IXKernelVmControl` 的 Binder 实现与调用方校验。 |
 | `ctl/main.rs` | 命令行客户端 `xkernel_vmctl status|start|stop|watch|console`。 |
 | `etc/` | 实例配置（`xkernel_vm.json` 为直接后端，`xkernel_vm.avf.json` 为经 AVF）、AVF 声明、init 脚本。 |
-| `sepolicy/` | system_ext 策略；`sepolicy/vendor/README.md` 说明设备节点的厂商侧标签。 |
+| `sepolicy/` | system_ext 策略：服务的域、接口、数据目录，直接后端的 crosvm 可执行文件类型及其转入 `crosvm` 域的规则。 |
+| `vendor/` | 厂商分区要带的 `/dev/xhyper` 类型、标签（`sepolicy/`）和权限（`ueventd.rc`），说明见 `vendor/README.md`。 |
 | `product.mk` | 产品集成片段。 |
 | `host-tests/` | 在开发机上运行纯逻辑模块的单元测试：`cd host-tests && cargo test`；GitHub 在每次推送和拉取请求时运行它，并检查格式和 clippy（`.github/workflows/host-tests.yml`）。服务本身只能在 Android 源码树里编译，不在 CI 中构建。 |
 
@@ -53,7 +54,8 @@ x-kernel 虚拟机的原生控制服务。它是这台设备上 x-kernel 虚拟�
 
 - 经 AVF 时，能力属性目前没有来源：虚拟化层的资源管理器还不计算它，开发验证时由 root 设置一次。直接后端不用它。
 - 经 AVF 时，AVF 对受保护虚拟机的磁盘镜像有 SELinux 标签检查；放在 `/data/misc/xkernel_vm` 的可写 rootfs 不在允许列表内，正式布局待定。
-- `/dev/xhyper` 目前只有 root 可访问，服务以 root 运行；SELinux 策略尚未在 Enforcing 下验证。
+- 服务以 `system` 用户运行，没有特权；宿主驱动按可锁定内存上限固定客户机内存，所以 init 脚本把上限设为不限（`rlimit memlock`）。经 AVF 的方式在非 root 下还没有验证过。
+- SELinux：策略经平台 neverallow 编译检查；2026-10-16 在平板上运行时加载平板策略加本策略和 `vendor/` 的类型，宽容模式下服务和 crosvm 没有一次访问被拒绝。还没有在强制模式、也没有由 init 启动的服务上验证。
 - 没有就绪握手配置时实例不会显示为“服务可用”；x-kernel 侧的握手端口待定。
 - 无固件模式不经固件认证镜像，也不传递 DICE 身份；宿主复位时不清理该虚拟机内存（与带固件路径不同）。
-- 直接后端：crosvm 二进制要由产品另行安装（示例配置假定在 `/system_ext/bin/xkernel_crosvm`），本仓库不带这个预编译文件；平台策略只允许 AVF 的 `crosvm` 域打开 `/dev/vhost-vsock` 和虚拟机管理设备，所以 crosvm 要由服务转入这个域运行（见 `sepolicy/vendor/README.md`），尚未编写和验证；服务重启后若发现上一轮的 crosvm 仍在（父进程死亡信号失效时才会发生），只会报告“回收待核实”，不会替它结束进程。
+- 直接后端：crosvm 二进制要由产品另行安装（示例配置假定在 `/system_ext/bin/xkernel_crosvm`），本仓库不带这个预编译文件；平台策略只允许 AVF 的 `crosvm` 域打开 `/dev/vhost-vsock` 和虚拟机管理设备，所以 crosvm 由服务转入这个域运行；服务的就绪握手不能用服务自己发起的 vsock 连接（平台策略只允许 AVF 的管理进程、adbd 和 traced 用 vsock）；服务不经 init 启动又被杀死时 crosvm 会留下，重启后的服务只报告“回收待核实”，不会替它结束进程；这个 crosvm 版本在 vCPU 出错后也以 33 退出，结束原因会被记成“客户机关机”。
