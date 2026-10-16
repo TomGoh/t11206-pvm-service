@@ -188,6 +188,18 @@ impl Console {
         Ok(GuestEnds { output: File::from(out_write), input: File::from(in_read) })
     }
 
+    /// Whether the output of `instance` kept so far contains `marker` (the readiness check: a
+    /// marker such as a shell prompt shows up within the first output, long before the history
+    /// would drop it).
+    pub fn seen(&self, instance: u64, marker: &[u8]) -> bool {
+        let inner = self.inner.lock().unwrap();
+        if marker.is_empty() || inner.history.instance != instance {
+            return false;
+        }
+        let data: Vec<u8> = inner.history.data.iter().copied().collect();
+        data.windows(marker.len()).any(|w| w == marker)
+    }
+
     /// Ends the console of `instance`: input is refused from now on, and the reader delivers
     /// what is left in the pipe and exits. The history stays until the next instance.
     pub fn end(&self, instance: u64) {
@@ -410,6 +422,26 @@ mod tests {
         h.begin(4);
         let s = h.snapshot();
         assert_eq!((s.instance, s.offset, s.data.len()), (4, 0, 0));
+    }
+
+    #[test]
+    fn a_marker_counts_only_in_its_instances_output() {
+        let console = Console::new();
+        let mut ends = console.begin(1).unwrap();
+        assert!(!console.seen(1, b"kylin-x:~#"));
+        ends.output.write_all(b"Welcome\r\nkylin-x:~# \x1b[6n").unwrap();
+        let deadline = Instant::now() + Duration::from_secs(2);
+        while !console.seen(1, b"kylin-x:~#") {
+            assert!(Instant::now() < deadline, "the prompt never counted");
+            thread::sleep(Duration::from_millis(10));
+        }
+        assert!(!console.seen(2, b"kylin-x:~#"), "another instance");
+        assert!(!console.seen(1, b""), "an empty marker");
+        assert!(!console.seen(1, b"kylin-x:/#"));
+        // A new instance starts from nothing.
+        console.end(1);
+        let _next = console.begin(2).unwrap();
+        assert!(!console.seen(2, b"kylin-x:~#"));
     }
 
     #[test]

@@ -22,7 +22,7 @@
 
 use crate::config::VmConfig;
 use crate::console::Console;
-use crate::controller::{Backend, Instance};
+use crate::controller::{Backend, Instance, Probe};
 use crate::machine::Exit;
 use android_system_virtualizationservice::aidl::android::system::virtualizationservice::{
     CpuOptions::{CpuOptions, CpuTopology::CpuTopology},
@@ -61,6 +61,8 @@ struct Manager {
 
 pub struct AvfInstance {
     vm: Arc<VmInstance>,
+    console: Arc<Console>,
+    generation: u64,
 }
 
 impl AvfBackend {
@@ -164,7 +166,7 @@ impl Backend for AvfBackend {
                 on_death(exit_of(reason));
             })
             .map_err(|e| format!("can't spawn the death watcher: {e}"))?;
-        Ok(AvfInstance { vm })
+        Ok(AvfInstance { vm, console: self.console.clone(), generation })
     }
 }
 
@@ -177,8 +179,11 @@ impl Instance for AvfInstance {
         self.vm.stop().map_err(|e| format!("stop: {e}"))
     }
 
-    fn probe_ready(&self, port: u32) -> bool {
-        self.vm.connect_vsock(port).is_ok()
+    fn probe_ready(&self, probe: &Probe) -> bool {
+        match probe {
+            Probe::Vsock(port) => self.vm.connect_vsock(*port).is_ok(),
+            Probe::ConsoleMarker(marker) => self.console.seen(self.generation, marker),
+        }
     }
 }
 

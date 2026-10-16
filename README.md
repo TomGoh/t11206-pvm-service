@@ -64,6 +64,6 @@ x-kernel 虚拟机的原生控制服务。它是这台设备上 x-kernel 虚拟�
 - 经 AVF 时，AVF 对受保护虚拟机的磁盘镜像有 SELinux 标签检查；放在 `/data/misc/xkernel_vm` 的可写 rootfs 不在允许列表内，正式布局待定。
 - 服务以 `system` 用户运行，没有特权；宿主驱动按可锁定内存上限固定客户机内存，所以 init 脚本把上限设为不限（`rlimit memlock`）。经 AVF 的方式在非 root 下还没有验证过。加载程序以 root 运行，只有加载模块和改设备节点属主的特权。
 - SELinux：策略经平台 neverallow 编译检查；2026-10-16 在平板上运行时加载平板策略加本策略，宽容模式下服务和 crosvm 没有一次访问被拒绝（启动器与按需加载另见实施记录）。还没有在强制模式、也没有由 init 启动的服务上验证。
-- 没有就绪握手配置时实例不会显示为“服务可用”；x-kernel 侧的握手端口待定。
+- 就绪：产品配置以串口输出里出现客户机的 shell 提示符 `kylin-x:~#` 作为就绪信号（`readiness.console_marker`），客户机不需要任何改动；提示符变了要同步改配置。也可以用 vsock 端口（`readiness.vsock_port`），但需要客户机监听，且在 SELinux 下只有经 AVF 时能用（平台策略只允许 AVF 的管理进程用 vsock）。没有配置时实例停在“运行中，服务未就绪”。
 - 无固件模式不经固件认证镜像，也不传递 DICE 身份；宿主复位时不清理该虚拟机内存（与带固件路径不同）。
 - 直接后端：crosvm 二进制要由产品另行安装（示例配置假定在 `/system_ext/bin/xkernel_crosvm`），本仓库不带这个预编译文件；平台策略只允许 AVF 的 `crosvm` 域打开 `/dev/vhost-vsock` 和虚拟机管理设备，所以 crosvm 由服务转入这个域运行；服务的就绪握手不能用服务自己发起的 vsock 连接（平台策略只允许 AVF 的管理进程、adbd 和 traced 用 vsock）；配置里没有 `launcher` 时，crosvm 直接由服务启动，转入 `crosvm` 域后父进程死亡信号被清除，服务被杀死后只有 init 结束进程组这一层保护；这个 crosvm 版本在 vCPU 出错后也以 33 退出，结束原因会被记成“客户机关机”。

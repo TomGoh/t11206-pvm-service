@@ -31,14 +31,23 @@ use std::sync::{Arc, Mutex, Weak};
 use std::thread;
 use std::time::{Duration, Instant};
 
+/// One way to tell that the guest is ready.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum Probe {
+    /// A vsock connection to this port succeeds.
+    Vsock(u32),
+    /// The instance's serial output contains these bytes (e.g. the guest's shell prompt).
+    ConsoleMarker(Vec<u8>),
+}
+
 /// A started VM, as the executor holds it.
 pub trait Instance: Send + Sync + 'static {
     /// The VM's vsock CID.
     fn cid(&self) -> i32;
     /// Asks AVF to stop the VM. The death is reported through the death hook.
     fn stop(&self) -> Result<(), String>;
-    /// One attempt of the readiness handshake: whether a vsock connection to `port` succeeds.
-    fn probe_ready(&self, port: u32) -> bool;
+    /// One attempt of the readiness handshake.
+    fn probe_ready(&self, probe: &Probe) -> bool;
 }
 
 /// Creates instances.
@@ -63,8 +72,8 @@ pub struct Settings {
     pub boot_id: String,
     pub stop_timeout: Duration,
     pub reclaim_window: Duration,
-    /// Vsock port and deadline of the readiness handshake.
-    pub readiness: Option<(u32, Duration)>,
+    /// How to tell the guest is ready, and how long to wait for it.
+    pub readiness: Option<(Probe, Duration)>,
 }
 
 #[derive(Debug, Default, Deserialize, Serialize, PartialEq, Eq)]
@@ -279,7 +288,7 @@ impl<B: Backend> Inner<B> {
     }
 
     fn probe_ready(self: &Arc<Self>, generation: u64) {
-        let Some((port, timeout)) = self.settings.readiness else { return };
+        let Some((probe, timeout)) = self.settings.readiness.clone() else { return };
         let weak = Arc::downgrade(self);
         spawn("xkvm-ready-probe", move || {
             let deadline = Instant::now() + timeout;
@@ -287,7 +296,7 @@ impl<B: Backend> Inner<B> {
                 let Some(inner) = weak.upgrade() else { return };
                 // Hold the instance only for one attempt, so a reclaim check is never delayed.
                 let Some(instance) = inner.current(generation) else { return };
-                if instance.probe_ready(port) {
+                if instance.probe_ready(&probe) {
                     drop(instance);
                     inner.post(Event::Ready { generation });
                     return;
@@ -448,7 +457,7 @@ mod tests {
             }
             Ok(())
         }
-        fn probe_ready(&self, _port: u32) -> bool {
+        fn probe_ready(&self, _probe: &Probe) -> bool {
             self.probes.fetch_add(1, Ordering::SeqCst) + 1 >= self.ready_after
         }
     }
@@ -486,7 +495,7 @@ mod tests {
     }
 
     impl Harness {
-        fn new(tag: &str, readiness: Option<(u32, Duration)>, setup: impl FnOnce(&Path)) -> Self {
+        fn new(tag: &str, readiness: Option<(Probe, Duration)>, setup: impl FnOnce(&Path)) -> Self {
             let root = std::env::temp_dir().join(format!("xkvm-ctl-{tag}-{}", std::process::id()));
             let _ = fs::remove_dir_all(&root);
             fs::create_dir_all(root.join("proc")).unwrap();
@@ -571,7 +580,7 @@ mod tests {
 
     #[test]
     fn readiness_probe_reaches_ready() {
-        let h = Harness::new("ready", Some((5000, Duration::from_secs(5))), |_| {});
+        let h = Harness::new("ready", Some((Probe::Vsock(5000), Duration::from_secs(5))), |_| {});
         h.controller.request_start().unwrap();
         h.wait_for(VmState::Ready);
     }

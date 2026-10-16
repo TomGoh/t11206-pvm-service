@@ -38,7 +38,7 @@
 
 use crate::config::{DirectConfig, Protection, VmConfig};
 use crate::console::Console;
-use crate::controller::{Backend, Instance};
+use crate::controller::{Backend, Instance, Probe};
 use crate::machine::Exit;
 use log::{info, warn};
 use std::fs::{self, File};
@@ -125,6 +125,8 @@ impl Process {
 pub struct DirectInstance {
     process: Arc<Process>,
     direct: DirectConfig,
+    console: Arc<Console>,
+    generation: u64,
     socket: PathBuf,
     cid: Option<u32>,
     kill_after: Duration,
@@ -302,6 +304,8 @@ impl Backend for DirectBackend {
         Ok(DirectInstance {
             process,
             direct: self.direct.clone(),
+            console: self.console.clone(),
+            generation,
             socket,
             cid: self.direct.cid,
             kill_after: Duration::from_secs(self.direct.kill_after_seconds),
@@ -404,8 +408,11 @@ impl Instance for DirectInstance {
         Ok(())
     }
 
-    fn probe_ready(&self, port: u32) -> bool {
-        self.cid.is_some_and(|cid| vsock_connects(cid, port))
+    fn probe_ready(&self, probe: &Probe) -> bool {
+        match probe {
+            Probe::Vsock(port) => self.cid.is_some_and(|cid| vsock_connects(cid, *port)),
+            Probe::ConsoleMarker(marker) => self.console.seen(self.generation, marker),
+        }
     }
 }
 
@@ -615,7 +622,11 @@ done
     fn runs_crosvm_with_the_console_and_stops_it_on_request() {
         let rig = Rig::new("stop");
         let instance = rig.start(1);
+        let marker = Probe::ConsoleMarker(b"fake x-kernel".to_vec());
         assert!(rig.wait_for("Welcome").contains("Welcome to the fake x-kernel"));
+        // The console readiness check sees what the guest printed.
+        assert!(instance.probe_ready(&marker));
+        assert!(!instance.probe_ready(&Probe::ConsoleMarker(b"not printed".to_vec())));
         let argv = fs::read_to_string(rig.dir.join("crosvm.sock.argv")).unwrap();
         let c = tablet_config(&rig.dir);
         let want = crosvm_args(&c, c.direct.as_ref().unwrap(), &rig.dir.join("crosvm.sock"));

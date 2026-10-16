@@ -41,8 +41,14 @@
 //! It does not use AVF's admission, so it checks neither virtmgr nor the AVF property; whether a
 //! protected VM may run is then up to the hypervisor alone.
 //!
+//! `readiness` says how the service learns the guest is ready (state `Ready`): the product
+//! config waits for the guest's shell prompt on the serial console (`console_marker`), which
+//! needs nothing from the guest; a vsock port (`vsock_port`) needs a listener in the guest and,
+//! under SELinux, AVF. Without it the instance stays `RunningNotReady`.
+//!
 //! The preconditions only read files and properties, so evaluating them never changes anything.
 
+use crate::controller::Probe;
 use anyhow::{bail, ensure, Context, Result};
 use log::info;
 use serde::Deserialize;
@@ -157,13 +163,32 @@ impl DiskConfig {
     }
 }
 
+/// How the service learns that the guest is ready: exactly one of `vsock_port` and
+/// `console_marker`.
 #[derive(Clone, Debug, Deserialize, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
 pub struct Readiness {
-    /// The guest is ready once a vsock connection to this port succeeds.
-    pub vsock_port: u32,
+    /// The guest is ready once a vsock connection to this port succeeds (it listens there).
+    /// Under SELinux only AVF's managers may connect over vsock, so this works through AVF only.
+    #[serde(default)]
+    pub vsock_port: Option<u32>,
+    /// The guest is ready once its serial output contains this text, e.g. its shell prompt. The
+    /// service keeps the console, so this asks nothing of the guest but what it prints anyway.
+    #[serde(default)]
+    pub console_marker: Option<String>,
     #[serde(default = "default_ready_timeout")]
     pub timeout_seconds: u64,
+}
+
+impl Readiness {
+    pub fn probe(&self) -> Probe {
+        match (&self.vsock_port, &self.console_marker) {
+            (Some(port), _) => Probe::Vsock(*port),
+            (None, Some(marker)) => Probe::ConsoleMarker(marker.as_bytes().to_vec()),
+            // Refused by validate().
+            (None, None) => Probe::ConsoleMarker(Vec::new()),
+        }
+    }
 }
 
 #[derive(Clone, Debug, Deserialize, PartialEq, Eq)]
@@ -292,7 +317,13 @@ impl VmConfig {
             ensure!(device == "hvc0" || device == "ttyS0", "console_input_device {device:?}");
         }
         if let Some(readiness) = &self.readiness {
-            ensure!(readiness.vsock_port > 0, "readiness.vsock_port must be positive");
+            match (readiness.vsock_port, &readiness.console_marker) {
+                (Some(port), None) => ensure!(port > 0, "readiness.vsock_port must be positive"),
+                (None, Some(marker)) => {
+                    ensure!(!marker.is_empty(), "readiness.console_marker must not be empty")
+                }
+                _ => bail!("readiness needs exactly one of vsock_port and console_marker"),
+            }
             ensure!(readiness.timeout_seconds > 0, "readiness.timeout_seconds must be positive");
         }
         ensure!(self.stop_timeout_seconds > 0, "stop_timeout_seconds must be positive");
@@ -319,7 +350,10 @@ impl VmConfig {
                         "direct.cid must be 3..{AVF_FIRST_CID}"
                     );
                 } else {
-                    ensure!(self.readiness.is_none(), "readiness needs direct.cid (vsock)");
+                    ensure!(
+                        self.readiness.as_ref().is_none_or(|r| r.vsock_port.is_none()),
+                        "a vsock readiness handshake needs direct.cid"
+                    );
                 }
                 ensure!(
                     (1..self.stop_timeout_seconds).contains(&direct.kill_after_seconds),
@@ -550,6 +584,49 @@ mod tests {
         )
         .is_err());
         fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn readiness_by_console_marker_or_vsock() {
+        let base = example(Path::new("/x"));
+        let with =
+            |readiness: &str| {
+                VmConfig::parse(&base.replace(
+                    r#""state_dir""#,
+                    &format!(r#""readiness": {readiness}, "state_dir""#),
+                ))
+            };
+        let c = with(r#"{ "console_marker": "kylin-x:~#" }"#).unwrap();
+        assert_eq!(
+            c.readiness.as_ref().unwrap().probe(),
+            Probe::ConsoleMarker(b"kylin-x:~#".to_vec())
+        );
+        assert_eq!(c.readiness.unwrap().timeout_seconds, 60);
+        let c = with(r#"{ "vsock_port": 5000, "timeout_seconds": 9 }"#).unwrap();
+        assert_eq!(c.readiness.unwrap().probe(), Probe::Vsock(5000));
+        for bad in [
+            r#"{ "vsock_port": 5000, "console_marker": "$" }"#,
+            r#"{ "timeout_seconds": 9 }"#,
+            r#"{ "console_marker": "" }"#,
+            r#"{ "vsock_port": 0 }"#,
+            r#"{ "console_marker": "$", "timeout_seconds": 0 }"#,
+        ] {
+            assert!(with(bad).is_err(), "accepted {bad}");
+        }
+        // The direct backend without a CID has no vsock, but the console works.
+        let direct = base.replace(
+            r#""state_dir""#,
+            r#""backend": "direct", "direct": { "crosvm": "/x/crosvm" }, "state_dir""#,
+        );
+        let direct_with =
+            |readiness: &str| {
+                VmConfig::parse(&direct.replace(
+                    r#""state_dir""#,
+                    &format!(r#""readiness": {readiness}, "state_dir""#),
+                ))
+            };
+        assert!(direct_with(r#"{ "console_marker": "kylin-x:~#" }"#).is_ok());
+        assert!(direct_with(r#"{ "vsock_port": 5000 }"#).is_err());
     }
 
     #[test]

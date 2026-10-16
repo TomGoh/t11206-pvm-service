@@ -116,7 +116,7 @@ fn serve<B: Backend>(config: VmConfig, backend: B, console: std::sync::Arc<Conso
         readiness: config
             .readiness
             .as_ref()
-            .map(|r| (r.vsock_port, Duration::from_secs(r.timeout_seconds))),
+            .map(|r| (r.probe(), Duration::from_secs(r.timeout_seconds))),
     };
     let preflight = {
         let config = config.clone();

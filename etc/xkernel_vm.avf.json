@@ -11,6 +11,7 @@
   ],
   "state_dir": "/data/misc/xkernel_vm",
   "console_input_device": "ttyS0",
+  "readiness": { "console_marker": "kylin-x:~#", "timeout_seconds": 60 },
   "stop_timeout_seconds": 30,
   "reclaim_window_seconds": 10,
   "backend": "avf",
