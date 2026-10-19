@@ -36,7 +36,7 @@ x-kernel 虚拟机的原生控制服务。它是这台设备上 x-kernel 虚拟�
 - `getEl2Counters()`：每个在线核在 EL2 用掉的周期数和读数时刻，代读宿主驱动的 `/proc/xcore_stats`。第一次取数时启动计数（需要时先按上节方式加载驱动）；某个核的读数消失或读取失败时重新写 1，至多每 5 秒一次；15 秒没有人取数就写 0 停止计数，把 PMU 还给宿主；服务启动时也停一次，收回上一个服务实例可能留下的计数。周期数按核当时的频率计数，换算成时间要用核实际运行的频率（监视器应用取 cpufreq 的 `time_in_state`）。
 - `getVmCpuTime()`：x-kernel 虚拟机全部 crosvm 进程（启动时记录的，加上按进程名 `crosvm_<name>` 扫描到的，扫描结果保留 5 秒）的 utime + stime 之和。crosvm 在启动后才派生运行虚拟处理器的子进程，直接后端的启动又在启动器执行 crosvm 之前就返回，所以只靠启动时的记录会漏掉它们。x-kernel 的虚拟处理器由宿主线程代为调度，客户机运行的时间就记在这些线程上，其中也包含虚拟化层替它处理异常的时间和 crosvm 的设备模拟时间。
 
-调用方须是 root、system，或持有 `com.kylinos.xkernelvm.permission.READ_VM_STATS`（或控制权限）。这些是系统级的处理器占用数据，平台策略不让普通应用读 `/proc/stat` 一类数据，所以接口不对所有应用开放。权限由控制应用声明，保护级别 `signature|privileged|development`：平台签名或获准的特权应用自动获得，调试设备上用 `pm grant <包名> com.kylinos.xkernelvm.permission.READ_VM_STATS` 授予。SELinux 上监视接口的类型带 `app_api_service` 属性，应用可以查到并调用；`/proc/xcore_stats` 有自己的标签 `proc_xcore_stats`，只有服务能读写、加载程序能改属主。命令行 `xkernel_vmctl monitor [--count N] [--interval-ms MS]` 打印原始读数。
+调用方须是 root、system，或持有 `com.kylinos.xkernelvm.permission.READ_VM_STATS`（或控制权限）。这些是系统级的处理器占用数据，平台策略不让普通应用读 `/proc/stat` 一类数据，所以接口不对所有应用开放。权限由控制应用声明，保护级别 `signature|privileged|development`：平台签名的应用和特权应用（装在 priv-app 下，产品镜像里的监视器就是这样装的）开机即获得，不需要 privapp 白名单（白名单只管平台定义的权限）；调试设备上 adb 装的普通应用用 `pm grant <包名> com.kylinos.xkernelvm.permission.READ_VM_STATS` 授予。SELinux 上监视接口的类型带 `app_api_service` 属性，应用可以查到并调用；`/proc/xcore_stats` 有自己的标签 `proc_xcore_stats`，只有服务能读写、加载程序能改属主。命令行 `xkernel_vmctl monitor [--count N] [--interval-ms MS]` 打印原始读数。
 
 ## 经 AVF 时
 

@@ -11,6 +11,9 @@ MODULES_DIR=${MODULES_DIR:-/data/local/tmp/xhyper-new}
 KERNEL=${KERNEL:-/data/local/tmp/xkernel-pvm/vm/kernel.bin}
 DUMMY=${DUMMY:-/data/local/tmp/xkernel-pvm/vm/dummy.img}
 BINS="xkernel_vm_service xkernel_vmctl xkernel_crosvm_launcher xkernel_vm_loader"
+# The monitor app (OS之OS监控软件), when install.sh staged one: a privileged system app, as the
+# product image carries it, so it holds READ_VM_STATS from boot without pm grant.
+MONITOR=$E/priv-app/KylinMonitor
 CONTEXTS="file property service"
 
 # The partition's own SELinux file: ours is the block from the marker line to the end.
@@ -74,6 +77,12 @@ files)
     chown -R root:root $E/etc/init/xkernel_vm_service.rc $E/etc/xkernel_vm
     chmod 0644 $E/etc/init/xkernel_vm_service.rc $E/etc/xkernel_vm/*.* $E/etc/xkernel_vm/modules/*
     chmod 0755 $E/etc/xkernel_vm $E/etc/xkernel_vm/modules
+    if [ -f $ST/monitor.apk ]; then
+        mkdir -p $MONITOR
+        cp $ST/monitor.apk $MONITOR/.KylinMonitor.apk.new && mv $MONITOR/.KylinMonitor.apk.new $MONITOR/KylinMonitor.apk
+        chown -R root:root $MONITOR; chmod 0755 $MONITOR; chmod 0644 $MONITOR/KylinMonitor.apk
+        echo "monitor app: $MONITOR/KylinMonitor.apk"
+    fi
 
     # SELinux: the partition's files without our earlier block, plus this repository's.
     for c in $CONTEXTS; do
@@ -97,6 +106,7 @@ files)
     restorecon -RF $E/bin/xkernel_vm_service $E/bin/xkernel_vmctl $E/bin/xkernel_crosvm_launcher \
         $E/bin/xkernel_vm_loader $E/bin/xkernel_crosvm $E/etc/init/xkernel_vm_service.rc \
         $E/etc/xkernel_vm $SE
+    if [ -d $MONITOR ]; then restorecon -RF $MONITOR; fi
     if [ -d /data/misc/xkernel_vm ]; then restorecon -RF /data/misc/xkernel_vm; fi
     sync
     ls -Z $E/bin | grep xkernel
@@ -105,7 +115,7 @@ files)
 remove)
     remount system_ext
     for b in $BINS xkernel_crosvm; do rm -f $E/bin/$b; done
-    rm -rf $E/etc/init/xkernel_vm_service.rc $E/etc/xkernel_vm
+    rm -rf $E/etc/init/xkernel_vm_service.rc $E/etc/xkernel_vm $MONITOR
     restore_selinux
     sync
     echo "removed (the overlay stays until enable-verity): reboot"

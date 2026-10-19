@@ -20,6 +20,7 @@ device/t11206/install.sh status                 # 查看服务、驱动和虚拟
 | init 脚本 | `/system_ext/etc/init/xkernel_vm_service.rc` |
 | 实例配置（`etc/xkernel_vm.json`）、客户机内核、只读盘 | `/system_ext/etc/xkernel_vm/` |
 | 宿主驱动模块与加载顺序（`etc/modules.load`） | `/system_ext/etc/xkernel_vm/modules/` |
+| 监视器应用（只在设置了 `MONITOR_APK` 时） | `/system_ext/priv-app/KylinMonitor/KylinMonitor.apk`：特权系统应用，开机即持有 `READ_VM_STATS`，不用 `pm grant` |
 | SELinux | `/system_ext/etc/selinux/`：`system_ext_additions.cil` 接在 `system_ext_sepolicy.cil` 后面；`sepolicy/private` 的三个 contexts 文件的条目接在对应的 `system_ext_*_contexts` 后面；`system_ext_sepolicy_and_mapping.sha256` 改为新内容的摘要 |
 
 可写盘和状态目录仍在 `/data/misc/xkernel_vm`（init 脚本建目录）。
@@ -29,6 +30,12 @@ SELinux 的要点：
 - 预编译策略（`/odm/etc/selinux/precompiled_sepolicy`）只在各分区的 `*_sepolicy_and_mapping.sha256` 与它记录的一致时使用；摘要文件一变，init 开机时用 `/system/bin/secilc` 现场编译（多约 1.5 秒）。
 - `files` 在提示重启之前，用设备上的 `secilc`、按 init 的参数和文件顺序把合并后的策略编译一遍（`on-device.sh` 的 `compile_as_init`）；编译失败就恢复原来的 SELinux 文件并退出，不会留下一个开不了机的策略。编译成功后当场加载这份策略，再用 `restorecon -RF` 按新的 `file_contexts` 给文件打标签（标签写在叠加层文件上，重启后保留）。
 - 重复运行不会叠加：合并前先去掉文件里以 `x-kernel VM control service` 那一行开头的旧块。
+
+### 让监视器应用开箱即用
+
+`MONITOR_APK=<已签名的监视器 APK> install.sh files <构建目录>` 会把“OS之OS监控软件”（`com.kylinos.monitor`）装成特权系统应用，与产品镜像里的做法相同。之后每次开机，系统自动授予它读取监视接口的权限；第一次打开时，服务按需加载驱动并开始计数，不需要任何手动步骤。之前用 adb 装过的副本要先 `pm uninstall com.kylinos.monitor`，否则它会作为系统应用的更新保留下来。特权权限白名单只检查平台定义的权限，这个权限由控制应用定义，所以不用加白名单文件；监视器应用也没有申请平台特权权限，平板的白名单强制模式不会因此拦下开机。
+
+2026-10-19 在 T11206HXH6600007 上验证：卸载 adb 装的副本、按上面装好后重启，`dumpsys package` 显示应用为 `PRIVILEGED SYSTEM_EXT`、`READ_VM_STATS: granted=true`；开机后直接打开应用，服务 0.13 秒内加载驱动并开始计数，两栏都有数据。
 
 ## 撤销
 

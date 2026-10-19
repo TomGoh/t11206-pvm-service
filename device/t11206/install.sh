@@ -17,6 +17,12 @@
 # DUMMY, the guest kernel and its read-only disk. The writable disk and state stay in
 # /data/misc/xkernel_vm, as etc/xkernel_vm.json says.
 #
+# MONITOR_APK (optional, a signed APK on this host): the monitor app (OS之OS监控软件,
+# com.kylinos.monitor), installed as the privileged system app /system_ext/priv-app/KylinMonitor
+# the way the product image carries it. A privileged app holds READ_VM_STATS from boot (the
+# privapp allowlist covers only platform permissions), so the monitor works without pm grant.
+# Uninstall a copy installed with adb first, or it stays as an update of the system app.
+#
 # `files` copies the programs, the init script, the instance config, the guest images and the
 # modules to their product locations and merges this repository's SELinux policy into
 # /system_ext/etc/selinux: system_ext_additions.cil is appended to system_ext_sepolicy.cil, the
@@ -55,6 +61,9 @@ files)
     build=${2:?BUILD_DIR}
     stage "$build/xkernel_vm_service" "$build/xkernel_vmctl" "$build/xkernel_crosvm_launcher" \
         "$build/xkernel_vm_loader"
+    if [ -n "${MONITOR_APK:-}" ]; then
+        adb -s "$SERIAL" push "$MONITOR_APK" $ST/monitor.apk > /dev/null
+    fi
     device files
     ;;
 remove)

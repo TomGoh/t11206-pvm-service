@@ -12,6 +12,13 @@ PRODUCT_PACKAGES += \
 
 SYSTEM_EXT_PRIVATE_SEPOLICY_DIRS += $(dir $(lastword $(MAKEFILE_LIST)))sepolicy/private
 
+# The monitor app (OS之OS监控软件, com.kylinos.monitor) reads the service's read-only monitoring
+# interface with the permission READ_VM_STATS, which the control app declares
+# signature|privileged|development. Ship the monitor as a privileged app (priv-app, as the
+# StarKylinMonitor prebuilt was) and it holds the permission from boot with no grant step; no
+# privapp-permissions entry is needed, that allowlist covers only platform permissions. The
+# service loads the driver and starts the counters on the monitor's first read.
+
 # The hypervisor host driver's modules, in the order of etc/modules.load. They are built with the
 # device's kernel and are not kept in this repository: the image build sets
 # XKERNEL_VM_MODULES_DIR to the directory holding them, and they are installed beside
