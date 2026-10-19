@@ -10,12 +10,12 @@ package com.kylinos.xkernelvm;
 parcelable El2CycleSample {
     /**
      * The CPU, as the driver lists it: the hypervisor's CPU id. It equals Linux's CPU number on
-     * T11206, and clients use it as such (e.g. to find the CPU's cpufreq policy).
+     * T11206, and clients use it as such.
      */
     int cpu;
     /**
      * Cycles this CPU has spent in EL2 while the counters ran, counted at the CPU's clock of the
-     * moment: divide by the frequency the CPU ran at, not its maximum, to get time. A restart
+     * moment (a share of time needs a frequency, which the client chooses). A restart
      * continues from the stopped value; a count that drops (its counter was lost) is a new
      * baseline, not a negative interval.
      */

@@ -42,7 +42,7 @@ x-kernel 虚拟机的原生控制服务。它是这台设备上 x-kernel 虚拟�
   - 加载失败的原因记 30 秒，启动失败的原因记 5 秒，期间直接回答这个原因，不让轮询的客户端带着加载程序或驱动的全局控制一起空转。
   - 只在需要时重新写 1，至多每 5 秒一次：某个在线核的读数连续两次缺失（下线的核不算），读取失败，或者所有核的计数 1 秒没动（被别人写了 0，或驱动被重新加载）。运行中写 1 并不便宜：只要有核在深度空闲里，驱动就会重新下发全局控制，唤醒所有核，还会把 EL2 时间加到正在测的读数上。
   - 15 秒没有人取数就写 0 停止计数，把 PMU 还给宿主（失败时下次再试，最多 5 次）；服务启动时也停一次，收回上一个服务实例可能留下的计数。
-  - 周期数按核当时的频率计数，换算成时间要用核实际运行的频率（监视器应用取 cpufreq 的 `time_in_state`）。驱动按虚拟化层的核号列出，T11206 上与 Linux 的核号相同，客户端按此使用。
+  - 周期数按核当时的频率计数，换算成占用要选定一个频率，选哪个由客户端决定。驱动按虚拟化层的核号列出，T11206 上与 Linux 的核号相同，客户端按此使用。
 - `getVmCpuTime()`：x-kernel 虚拟机全部 crosvm 进程的 utime + stime 之和。进程包括启动时记录的，加上按进程名 `crosvm_<name>` 扫描到的，扫描结果保留 5 秒：crosvm 在启动后才派生运行虚拟处理器的子进程，直接后端的启动又在启动器执行 crosvm 之前就返回，所以只靠启动时的记录会漏掉它们。读数附带进程集合的标识 `processSet`；集合变化时（例如启动后才扫描到子进程），客户端要像换了实例一样重新取基准。x-kernel 的虚拟处理器由宿主线程代为调度，客户机运行的时间就记在这些线程上，其中也包含虚拟化层替它处理异常的时间和 crosvm 的设备模拟时间。
 
 调用方须是 root、system，或持有 `com.kylinos.xkernelvm.permission.READ_VM_STATS`（或控制权限）。这些是系统级的处理器占用数据，平台策略不让普通应用读 `/proc/stat` 一类数据，所以接口不对所有应用开放。权限由控制应用声明，保护级别 `signature|privileged|development`：平台签名的应用和特权应用（装在 priv-app 下，产品镜像里的监视器就是这样装的）开机即获得，不需要 privapp 白名单（白名单只管平台定义的权限）；调试设备上 adb 装的普通应用用 `pm grant <包名> com.kylinos.xkernelvm.permission.READ_VM_STATS` 授予。SELinux 上监视接口的类型带 `app_api_service` 属性，应用可以查到并调用；`/proc/xcore_stats` 有自己的标签 `proc_xcore_stats`，只有服务能读写、加载程序能改属主。命令行 `xkernel_vmctl monitor [--count N] [--interval-ms MS]` 打印原始读数。
@@ -65,14 +65,14 @@ x-kernel 虚拟机的原生控制服务。它是这台设备上 x-kernel 虚拟�
 | `src/service.rs` | `IXKernelVmControl` 与 `IXKernelVmMonitor` 的 Binder 实现与调用方校验。 |
 | `src/monitor.rs` | 监视接口的数据：EL2 周期计数的启停与读取、x-kernel 虚拟机进程的处理器时间。 |
 | `guest/` | 客户机里用的工具：负载模拟 `xkload.sh`，以及把它放进根文件系统模板的 `add-to-rootfs.sh`（`debugfs`，不需要 root）；说明见其 `README.md`。 |
-| `product/` | 给做镜像的同事：集成说明 `README.md`，以及预编译目录用的 Android.bp 模板（crosvm、监视器应用）。 |
+| `product/` | 给做镜像的同事：集成说明 `README.md`（源码交付和二进制交付两种方式）；源码交付时预编译目录用的 Android.bp 模板（crosvm）；`binary/`：生成二进制交付目录的 `make-drop.sh` 及其 Android.bp、product.mk 模板；`monitor/`：监视器按 Kylin 应用惯例导入时用的 Android.bp 模板。 |
 | `ctl/main.rs` | 命令行客户端 `xkernel_vmctl status|start|stop|watch|console|monitor`。 |
 | `etc/` | 实例配置（`xkernel_vm.json` 为直接后端，`xkernel_vm.avf.json` 为经 AVF）、AVF 声明、init 脚本。 |
 | `sepolicy/` | system_ext 策略：服务的域、两个接口（监视接口应用可查到）、数据目录、`/proc/xcore_stats` 的标签（`genfs_contexts`）；启动器转入 `crosvm` 域、crosvm 程序本身的类型；加载程序的域、模块文件、驱动属性；设备节点 `xhyper_device`（只有 crosvm 域能打开）。 |
 | `src/driver.rs` | 按需加载宿主驱动：请求、等待结果。 |
 | `launcher/` | `xkernel_crosvm_launcher`：进入 `crosvm` 域后重新设置父进程死亡信号，再执行 crosvm。 |
 | `loader/` | `xkernel_vm_loader`：按 `modules.load` 加载模块、准备设备节点、报告结果（逻辑在 `loader.rs`，可在开发机测试）。 |
-| `product.mk` | 产品集成片段：源码编译的模块、策略目录，以及预编译目录 `XKERNEL_VM_PREBUILTS_DIR` 里的驱动模块、客户机内核与磁盘镜像、crosvm 和监视器应用（见 `product/README.md`）。 |
+| `product.mk` | 源码交付的产品集成片段：源码编译的模块、策略目录，以及预编译目录 `XKERNEL_VM_PREBUILTS_DIR` 里的驱动模块、客户机内核与磁盘镜像和 crosvm（见 `product/README.md`）。二进制交付用交付目录里生成的 `product.mk`。 |
 | `device/t11206/` | 在 T11206 调试平板上不刷机、按产品方式安装（init 拉起、SELinux 生效）的脚本，以及并入系统扩展分区的策略增量 `system_ext_additions.cil`；说明见其 `README.md`。 |
 | `host-tests/` | 在开发机上运行纯逻辑模块的单元测试：`cd host-tests && cargo test`；GitHub 在每次推送和拉取请求时运行它，并检查格式和 clippy（`.github/workflows/host-tests.yml`）。服务本身只能在 Android 源码树里编译，不在 CI 中构建。 |
 

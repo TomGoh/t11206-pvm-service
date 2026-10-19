@@ -30,13 +30,11 @@ SYSTEM_EXT_PRIVATE_SEPOLICY_DIRS += $(dir $(lastword $(MAKEFILE_LIST)))sepolicy/
 #   rootfs.img                              the guest's root file system: the template the service
 #                                           copies to /data/misc/xkernel_vm on the first start
 #   xkernel_crosvm                          crosvm with the hypervisor's backend (statically linked)
-#   KylinMonitor.apk                        the monitor app (OS之OS监控软件, com.kylinos.monitor)
 #   Android.bp                              this repository's product/prebuilts.bp.template
 #
-# The Android.bp there turns xkernel_crosvm and KylinMonitor.apk into modules: an ELF under bin
-# and an app cannot go through PRODUCT_COPY_FILES. The monitor is a privileged app, which gives it
-# READ_VM_STATS from boot without a grant step (no privapp-permissions entry is needed: that
-# allowlist covers platform permissions only).
+# The Android.bp there turns xkernel_crosvm into a module: an ELF under bin cannot go through
+# PRODUCT_COPY_FILES. The monitor app (OS之OS监控软件, com.kylinos.monitor) is not part of this
+# package: it is imported like the product's other Kylin apps (product/monitor/).
 ifeq ($(XKERNEL_VM_PREBUILTS_DIR),)
 $(error XKERNEL_VM_PREBUILTS_DIR must name the directory of the x-kernel VM prebuilts (see product/README.md))
 endif
@@ -50,9 +48,7 @@ XKERNEL_VM_MODULES := \
     xhyper_irqfd.ko \
     xhyper_ioeventfd.ko
 
-PRODUCT_PACKAGES += \
-    xkernel_crosvm \
-    KylinMonitor
+PRODUCT_PACKAGES += xkernel_crosvm
 
 # Plain files under etc (the ELF check of PRODUCT_COPY_FILES covers bin and lib paths only).
 PRODUCT_COPY_FILES += \

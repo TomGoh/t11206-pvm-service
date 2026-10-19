@@ -30,9 +30,8 @@
 //!   run by a thread; a failed stop is retried up to [`STOP_ATTEMPTS`] times), and at service
 //!   start ([`El2Monitor::reset`]) in case an earlier run of the service left them running.
 //!
-//! The cycles are counted at the CPU's clock of the moment; turning them into time needs the
-//! frequency the CPU ran at, which the client takes from cpufreq's `time_in_state`. The driver
-//! numbers CPUs by the hypervisor's CPU id; on T11206 it equals Linux's CPU number (pinning Linux
+//! The cycles are counted at the CPU's clock of the moment, so a share of time needs a frequency;
+//! which one is the client's choice. The driver numbers CPUs by the hypervisor's CPU id; on T11206 it equals Linux's CPU number (pinning Linux
 //! CPUs 0-3 changed exactly the EL2 rates of ids 0-3), and this module and its clients assume so.
 //!
 //! **VM CPU time** is utime + stime of the VM's crosvm processes (`/proc/<pid>/stat`, every

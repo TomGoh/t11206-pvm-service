@@ -1,0 +1,20 @@
+// The monitor app (OS之OS监控软件, com.kylinos.monitor), imported like the product's other Kylin
+// apps: copy to vendor/kylinos/apps/kylinos_apps/KylinosMonitor/Android.bp next to the APK built
+// from the monitor repository (2030/kylin100/monitor), and add KylinosMonitor to PRODUCT_PACKAGES
+// in vendor/kylinos/apps/kylinos_apps/device.mk (product/README.md of t11206-pvm-service).
+//
+// Re-signed with the platform key and installed as a privileged app, it holds
+// com.kylinos.xkernelvm.permission.READ_VM_STATS from boot: no grant step, and no
+// privapp-permissions entry (that allowlist covers platform permissions only). The APK may come
+// unsigned or signed with any key; the build strips that signature.
+
+android_app_import {
+    name: "KylinosMonitor",
+    apk: "KylinosMonitor.apk",
+    certificate: "platform",
+    dex_preopt: {
+        enabled: true,
+    },
+    privileged: true,
+    product_specific: true,
+}

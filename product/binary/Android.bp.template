@@ -1,0 +1,112 @@
+// The x-kernel VM package as built files (binary delivery). make-drop.sh of t11206-pvm-service
+// copies this file into the delivery directory as Android.bp, next to the files it names; the
+// directory's product.mk puts the modules in PRODUCT_PACKAGES.
+//
+// The module names are those of the source build (Android.bp of t11206-pvm-service and
+// t11206-pvm-app) on purpose: a tree that holds both the source repositories and this directory
+// fails with duplicate modules instead of installing one of them unnoticed. The binaries come
+// stripped from the source build of the same Android baseline; their shared libraries are
+// declared so that the build's ELF check still runs, except where a platform library may not be
+// named (see xkernel_vm_service).
+
+package {
+    default_applicable_licenses: ["Android-Apache-2.0"],
+}
+
+// The control service, with its init script and the files it pulls in, as in the source build.
+// It also needs libbinder_rpc_unstable, which the platform image installs in /system/lib64 for the
+// Virtualization module and whose visibility no module outside the platform may name; the source
+// build reaches it through libvmclient. So that library is not declared and the ELF check is off.
+cc_prebuilt_binary {
+    name: "xkernel_vm_service",
+    srcs: ["bin/xkernel_vm_service"],
+    compile_multilib: "64",
+    strip: {
+        none: true,
+    },
+    shared_libs: [
+        "libbinder_ndk",
+        "liblog",
+    ],
+    check_elf_files: false,
+    system_ext_specific: true,
+    init_rc: ["etc/init/xkernel_vm_service.rc"],
+    required: [
+        "xkernel_crosvm_launcher",
+        "xkernel_vm.json",
+        "xkernel_vm_loader",
+        "xkernel_vm_modules.load",
+    ],
+}
+
+// Starts crosvm in the crosvm domain and re-arms the parent-death signal.
+cc_prebuilt_binary {
+    name: "xkernel_crosvm_launcher",
+    srcs: ["bin/xkernel_crosvm_launcher"],
+    compile_multilib: "64",
+    strip: {
+        none: true,
+    },
+    system_ext_specific: true,
+}
+
+// Loads the host driver's modules on the service's request.
+cc_prebuilt_binary {
+    name: "xkernel_vm_loader",
+    srcs: ["bin/xkernel_vm_loader"],
+    compile_multilib: "64",
+    strip: {
+        none: true,
+    },
+    shared_libs: ["liblog"],
+    system_ext_specific: true,
+}
+
+// The shell client; product.mk installs it in debugging builds only.
+cc_prebuilt_binary {
+    name: "xkernel_vmctl",
+    srcs: ["bin/xkernel_vmctl"],
+    compile_multilib: "64",
+    strip: {
+        none: true,
+    },
+    shared_libs: ["libbinder_ndk"],
+    system_ext_specific: true,
+}
+
+// crosvm with the hypervisor's backend: /system_ext/bin/xkernel_crosvm, the path
+// etc/xkernel_vm.json names and the service's file_contexts labels. Statically linked.
+cc_prebuilt_binary {
+    name: "xkernel_crosvm",
+    srcs: ["bin/xkernel_crosvm"],
+    compile_multilib: "64",
+    strip: {
+        none: true,
+    },
+    check_elf_files: false,
+    system_ext_specific: true,
+}
+
+prebuilt_etc {
+    name: "xkernel_vm.json",
+    src: "etc/xkernel_vm.json",
+    system_ext_specific: true,
+    relative_install_path: "xkernel_vm",
+}
+
+prebuilt_etc {
+    name: "xkernel_vm_modules.load",
+    src: "etc/modules.load",
+    filename: "modules.load",
+    system_ext_specific: true,
+    relative_install_path: "xkernel_vm/modules",
+}
+
+// The control app, re-signed with the platform key by this build (it declares the signature
+// permission CONTROL_VM and calls platform APIs).
+android_app_import {
+    name: "XKernelVmControl",
+    apk: "app/XKernelVmControl.apk",
+    certificate: "platform",
+    system_ext_specific: true,
+}
