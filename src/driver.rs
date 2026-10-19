@@ -16,7 +16,9 @@
 //! names are also in `loader/main.rs` and the init script.
 //!
 //! A start and the monitoring interface (`monitor`) may both need the driver; one loader serves
-//! both and handles one request at a time. A second request while the loader runs would be lost:
+//! both and handles one request at a time. The monitoring interface can also ask for a run while
+//! the driver is loaded ([`DriverLoader::reload`]): the loader skips the loaded modules and
+//! prepares the device node and the EL2 counter file again, for a driver someone else loaded. A second request while the loader runs would be lost:
 //! init does not start a oneshot service again while it runs, so that request would never get a
 //! result. A caller that waited for the other's load finds the node and asks for nothing.
 
@@ -60,9 +62,18 @@ impl DriverLoader {
         if exists_without_stat(&self.device) {
             return Ok(());
         }
+        self.load(false)
+    }
+
+    /// Asks the loader to run even if the driver is loaded, and waits for its result.
+    pub fn reload(&self) -> Result<(), String> {
+        self.load(true)
+    }
+
+    fn load(&self, force: bool) -> Result<(), String> {
         let _loading = self.loading.lock().unwrap();
         // Another caller may have loaded it while this one waited.
-        if exists_without_stat(&self.device) {
+        if !force && exists_without_stat(&self.device) {
             return Ok(());
         }
         // Unique within a boot: a restarted service has another PID.
@@ -238,6 +249,19 @@ mod tests {
         let err = loader.ensure_loaded().unwrap_err();
         assert!(err.contains("did not load within"), "{err}");
         assert!(started.elapsed() >= Duration::from_millis(300));
+    }
+
+    #[test]
+    fn a_reload_asks_even_with_the_node_there() {
+        let rig = Rig::new("reload");
+        fs::write(rig.device(), b"").unwrap();
+        let loader = rig.loader(1000, |_, props, request| {
+            status(props, format!("loaded {request}"));
+        });
+        assert_eq!(loader.ensure_loaded(), Ok(()));
+        assert!(rig.props.lock().unwrap().is_empty(), "loaded: no request");
+        assert_eq!(loader.reload(), Ok(()));
+        assert_eq!(rig.props.lock().unwrap()[LOAD_PROPERTY], format!("{}.1", std::process::id()));
     }
 
     #[test]

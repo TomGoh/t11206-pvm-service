@@ -443,11 +443,12 @@ impl<B: Backend> IXKernelVmMonitor for MonitorService<B> {
         let instance = self.controller.snapshot().generation;
         let processes = self.processes.get(instance, &self.controller.processes());
         Ok(match monitor::vm_cpu_time(&self.proc_root, &processes, self.ticks_per_sec) {
-            Some(cpu_time_ns) => VmCpuTime {
+            Some(vm) => VmCpuTime {
                 running: true,
                 instance: instance as i64,
-                cpuTimeNs: cpu_time_ns as i64,
+                cpuTimeNs: vm.cpu_time_ns as i64,
                 timestampNs: monitor::monotonic_ns() as i64,
+                processSet: vm.process_set as i64,
             },
             None => VmCpuTime::default(),
         })

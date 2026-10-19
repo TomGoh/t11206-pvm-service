@@ -41,7 +41,7 @@ use crate::console::Console;
 use crate::controller::{Backend, Controller, Settings};
 use crate::direct::DirectBackend;
 use crate::driver::{DriverLoader, WithDriver};
-use crate::monitor::{El2Monitor, EnsureDriver, ProcFile, VmProcesses, XCORE_STATS};
+use crate::monitor::{online_cpus, El2Monitor, EnsureDriver, ProcFile, VmProcesses, XCORE_STATS};
 use crate::service::{
     Callbacks, ConsoleClients, ControlService, MonitorService, MONITOR_SERVICE_NAME, SERVICE_NAME,
 };
@@ -98,11 +98,14 @@ fn try_main() -> Result<()> {
             Box::new(|name| system_properties::read(name).ok().flatten()),
         ))
     });
-    let ensure_driver = driver.clone().map(|d| Box::new(move || d.ensure_loaded()) as EnsureDriver);
+    let ensure_driver = driver.clone().map(|d| {
+        Box::new(move |reload| if reload { d.reload() } else { d.ensure_loaded() }) as EnsureDriver
+    });
     let started = Instant::now();
     let el2 = Arc::new(El2Monitor::new(
         Box::new(ProcFile(PathBuf::from(XCORE_STATS))),
         ensure_driver,
+        Box::new(online_cpus),
         Box::new(move || started.elapsed()),
     ));
     el2.reset();
