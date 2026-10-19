@@ -7,7 +7,11 @@
   "protection": "without_firmware",
   "disks": [
     { "path": "/system_ext/etc/xkernel_vm/dummy.img", "writable": false },
-    { "path": "/data/misc/xkernel_vm/rootfs.img", "writable": true }
+    {
+      "path": "/data/misc/xkernel_vm/rootfs.img",
+      "writable": true,
+      "template": "/system_ext/etc/xkernel_vm/rootfs.img"
+    }
   ],
   "state_dir": "/data/misc/xkernel_vm",
   "console_input_device": "ttyS0",

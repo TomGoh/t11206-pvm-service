@@ -1,0 +1,41 @@
+// Copy to $(XKERNEL_VM_PREBUILTS_DIR)/Android.bp, next to the prebuilt files (product/README.md of
+// t11206-pvm-service). It turns the two prebuilts that need a module into modules: the crosvm
+// build with the hypervisor's backend (an ELF under bin) and the monitor app. product.mk puts both
+// names in PRODUCT_PACKAGES and copies the plain files (driver modules, guest images) itself.
+
+package {
+    default_applicable_licenses: ["Android-Apache-2.0"],
+}
+
+// /system_ext/bin/xkernel_crosvm, the path etc/xkernel_vm.json names and the service's
+// file_contexts labels. Statically linked: installed as delivered.
+cc_prebuilt_binary {
+    name: "xkernel_crosvm",
+    srcs: ["xkernel_crosvm"],
+    compile_multilib: "64",
+    strip: {
+        none: true,
+    },
+    check_elf_files: false,
+    system_ext_specific: true,
+}
+
+// The monitor app (OS之OS监控软件, com.kylinos.monitor), as a privileged app: it holds
+// com.kylinos.xkernelvm.permission.READ_VM_STATS from boot, with no grant step and no
+// privapp-permissions entry (that allowlist covers platform permissions only).
+android_app_import {
+    name: "KylinMonitor",
+    apk: "KylinMonitor.apk",
+    privileged: true,
+    system_ext_specific: true,
+    // Keeps the signature the APK was delivered with. The build then requires the APK to be
+    // signed (v2 or later), zipaligned with -p 4 and, as a privileged app, to store its dex files
+    // uncompressed: the monitor's Gradle build does that (packaging.dex.useLegacyPackaging false).
+    // To have the build re-sign it with the platform key instead, replace both lines with
+    // certificate: "platform",
+    presigned: true,
+    preprocessed: true,
+    dex_preopt: {
+        enabled: false,
+    },
+}

@@ -10,6 +10,9 @@ CROSVM=${CROSVM:-/data/local/tmp/xhyper-new/crosvm-xhyper}
 MODULES_DIR=${MODULES_DIR:-/data/local/tmp/xhyper-new}
 KERNEL=${KERNEL:-/data/local/tmp/xkernel-pvm/vm/kernel.bin}
 DUMMY=${DUMMY:-/data/local/tmp/xkernel-pvm/vm/dummy.img}
+# The guest's root file system template (etc/xkernel_vm.json "template"), optional: the service
+# copies it to /data/misc/xkernel_vm on the first start of a device that has no copy there yet.
+ROOTFS=${ROOTFS:-}
 BINS="xkernel_vm_service xkernel_vmctl xkernel_crosvm_launcher xkernel_vm_loader"
 # The monitor app (OS之OS监控软件), when install.sh staged one: a privileged system app, as the
 # product image carries it, so it holds READ_VM_STATS from boot without pm grant.
@@ -70,6 +73,9 @@ files)
     cp $ST/xkernel_vm_service.rc $E/etc/init/xkernel_vm_service.rc
     mkdir -p $E/etc/xkernel_vm/modules
     cp $ST/xkernel_vm.json "$KERNEL" "$DUMMY" $E/etc/xkernel_vm/
+    if [ -n "$ROOTFS" ]; then
+        cp "$ROOTFS" $E/etc/xkernel_vm/.rootfs.img.new && mv $E/etc/xkernel_vm/.rootfs.img.new $E/etc/xkernel_vm/rootfs.img
+    fi
     cp $ST/modules.load $E/etc/xkernel_vm/modules/
     for m in $(grep -o '^[A-Za-z0-9_-]*\.ko' $ST/modules.load); do
         cp "$MODULES_DIR/$m" $E/etc/xkernel_vm/modules/

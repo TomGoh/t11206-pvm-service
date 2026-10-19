@@ -16,11 +16,17 @@
 //!   "protection": "without_firmware",
 //!   "disks": [
 //!     { "path": "/system_ext/etc/xkernel_vm/dummy.img", "writable": false },
-//!     { "path": "/data/misc/xkernel_vm/rootfs.img", "writable": true }
+//!     { "path": "/data/misc/xkernel_vm/rootfs.img", "writable": true,
+//!       "template": "/system_ext/etc/xkernel_vm/rootfs.img" }
 //!   ],
 //!   "state_dir": "/data/misc/xkernel_vm"
 //! }
 //! ```
+//!
+//! A writable disk that is missing is made right before a start: copied from `template` (the
+//! product ships the guest's root file system read-only in system_ext; the first start of a new
+//! device copies it to `/data`, sparsely, through a temporary file renamed into place), or
+//! created empty and sparse with `create_size_mib`. Without either it must already exist.
 //!
 //! `protection` says how the instance is protected, so the UI can show the mode; through AVF it
 //! also names the hypervisor property the preconditions need. AVF itself decides: an instance
@@ -53,7 +59,7 @@ use anyhow::{bail, ensure, Context, Result};
 use log::info;
 use serde::Deserialize;
 use std::fs::{self, OpenOptions};
-use std::os::unix::fs::PermissionsExt;
+use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
 use std::path::{Path, PathBuf};
 
 /// Where the virtualization manager AVF spawns for each client lives.
@@ -138,16 +144,26 @@ pub struct DiskConfig {
     /// Create the image as a sparse file of this size when it is missing (writable disks only).
     #[serde(default)]
     pub create_size_mib: Option<u64>,
+    /// Copy this image when the disk is missing (writable disks only; not with
+    /// `create_size_mib`).
+    #[serde(default)]
+    pub template: Option<PathBuf>,
 }
+
+/// The block size of the sparse copy: a block of zeros is skipped instead of written.
+const COPY_BLOCK: usize = 1 << 20;
 
 impl DiskConfig {
     /// Creates the image when it is missing and may be created; the backends call this right
     /// before a start (it is the one thing here that writes).
     pub fn create_if_missing(&self) -> Result<()> {
-        let Some(size_mib) = self.create_size_mib else { return Ok(()) };
         if self.path.exists() {
             return Ok(());
         }
+        if let Some(template) = &self.template {
+            return self.copy_from(template);
+        }
+        let Some(size_mib) = self.create_size_mib else { return Ok(()) };
         if let Some(parent) = self.path.parent() {
             fs::create_dir_all(parent)
                 .with_context(|| format!("Can't create {}", parent.display()))?;
@@ -159,6 +175,60 @@ impl DiskConfig {
             .with_context(|| format!("Can't create {}", self.path.display()))?;
         file.set_len(size_mib * 1024 * 1024)?;
         info!("created sparse {} ({size_mib} MiB)", self.path.display());
+        Ok(())
+    }
+
+    /// Copies `template` to the disk's path, skipping blocks of zeros (the copy stays sparse),
+    /// into a temporary file that is renamed into place once complete and synced: a copy cut
+    /// short leaves no half image behind.
+    fn copy_from(&self, template: &Path) -> Result<()> {
+        use std::io::{Read, Seek, SeekFrom, Write};
+        let started = std::time::Instant::now();
+        let mut src = fs::File::open(template)
+            .with_context(|| format!("Can't open {}", template.display()))?;
+        let tmp = self.path.with_extension("tmp");
+        let _ = fs::remove_file(&tmp);
+        let mut dst = OpenOptions::new()
+            .create_new(true)
+            .write(true)
+            .mode(0o660)
+            .open(&tmp)
+            .with_context(|| format!("Can't create {}", tmp.display()))?;
+        // Not left to the umask: crosvm (same uid) and the system group read and write it.
+        dst.set_permissions(fs::Permissions::from_mode(0o660))?;
+        let mut block = vec![0u8; COPY_BLOCK];
+        let (mut len, mut written) = (0u64, 0u64);
+        loop {
+            let mut n = 0;
+            while n < block.len() {
+                match src.read(&mut block[n..])? {
+                    0 => break,
+                    k => n += k,
+                }
+            }
+            if n == 0 {
+                break;
+            }
+            if block[..n].iter().any(|b| *b != 0) {
+                dst.seek(SeekFrom::Start(len))?;
+                dst.write_all(&block[..n])?;
+                written += n as u64;
+            }
+            len += n as u64;
+        }
+        dst.set_len(len)?;
+        dst.sync_all()?;
+        drop(dst);
+        fs::rename(&tmp, &self.path)
+            .with_context(|| format!("Can't move {} into place", tmp.display()))?;
+        info!(
+            "copied {} to {} ({} MiB, {} MiB written) in {:.1}s",
+            template.display(),
+            self.path.display(),
+            len >> 20,
+            written >> 20,
+            started.elapsed().as_secs_f32()
+        );
         Ok(())
     }
 }
@@ -309,8 +379,16 @@ impl VmConfig {
         ensure!(self.hypervisor_device.is_absolute(), "hypervisor_device must be absolute");
         for disk in &self.disks {
             ensure!(disk.path.is_absolute(), "disk {} must be absolute", disk.path.display());
-            if disk.create_size_mib.is_some() && !disk.writable {
+            if (disk.create_size_mib.is_some() || disk.template.is_some()) && !disk.writable {
                 bail!("disk {}: only a writable disk can be created", disk.path.display());
+            }
+            if let Some(template) = &disk.template {
+                ensure!(
+                    disk.create_size_mib.is_none(),
+                    "disk {}: template or create_size_mib",
+                    disk.path.display()
+                );
+                ensure!(template.is_absolute(), "template {} must be absolute", template.display());
             }
         }
         if let Some(device) = &self.console_input_device {
@@ -406,8 +484,19 @@ impl VmConfig {
             return Err(format!("kernel image missing: {}", self.kernel.display()));
         }
         for disk in &self.disks {
-            if !disk.path.is_file() && disk.create_size_mib.is_none() {
-                return Err(format!("disk image missing: {}", disk.path.display()));
+            if disk.path.is_file() || disk.create_size_mib.is_some() {
+                continue;
+            }
+            match &disk.template {
+                Some(template) if template.is_file() => {}
+                Some(template) => {
+                    return Err(format!(
+                        "disk image missing: {} (and its template {})",
+                        disk.path.display(),
+                        template.display()
+                    ))
+                }
+                None => return Err(format!("disk image missing: {}", disk.path.display())),
             }
         }
         Ok(())
@@ -639,12 +728,46 @@ mod tests {
             (r#""kernel": "/x/kernel.bin""#, r#""kernel": "kernel.bin""#),
             (r#""protection": "without_firmware""#, r#""protection": "maybe""#),
             (r#""writable": false }"#, r#""writable": false, "create_size_mib": 1 }"#),
+            (r#""writable": false }"#, r#""writable": false, "template": "/x/t.img" }"#),
+            (r#""create_size_mib": 64 }"#, r#""create_size_mib": 64, "template": "/x/t.img" }"#),
+            (r#""create_size_mib": 64 }"#, r#""template": "t.img" }"#),
             (r#""cpus": 1,"#, r#""cpus": 1, "surprise": 1,"#),
         ] {
             assert!(good.contains(from), "{from}");
             let bad = good.replace(from, to);
             assert!(VmConfig::parse(&bad).is_err(), "accepted {to}");
         }
+    }
+
+    #[test]
+    fn a_missing_disk_is_copied_sparsely_from_its_template_once() {
+        let dir = std::env::temp_dir().join(format!("xkvm-template-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+        // 3 MiB + 5 bytes: data, a block of zeros, data, a short tail.
+        let mut image = vec![0u8; 3 * COPY_BLOCK + 5];
+        image[10] = 1;
+        image[2 * COPY_BLOCK + 7] = 2;
+        image[3 * COPY_BLOCK + 4] = 3;
+        let template = dir.join("template.img");
+        fs::write(&template, &image).unwrap();
+        let disk = DiskConfig {
+            path: dir.join("data/rootfs.img"),
+            writable: true,
+            create_size_mib: None,
+            template: Some(template),
+        };
+        fs::create_dir_all(dir.join("data")).unwrap();
+        fs::write(dir.join("data/rootfs.tmp"), b"left by a copy cut short").unwrap();
+        disk.create_if_missing().unwrap();
+        assert_eq!(fs::read(&disk.path).unwrap(), image);
+        assert!(!dir.join("data/rootfs.tmp").exists());
+        assert_eq!(fs::metadata(&disk.path).unwrap().permissions().mode() & 0o777, 0o660);
+        // An existing disk is the guest's data: never copied over.
+        fs::write(&disk.path, b"guest data").unwrap();
+        disk.create_if_missing().unwrap();
+        assert_eq!(fs::read(&disk.path).unwrap(), b"guest data");
+        fs::remove_dir_all(&dir).unwrap();
     }
 
     #[test]

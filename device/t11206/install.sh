@@ -14,8 +14,9 @@
 # BUILD_DIR holds xkernel_vm_service, xkernel_vmctl, xkernel_crosvm_launcher and xkernel_vm_loader
 # (the Android build of this repository). From the device (environment overrides): CROSVM, the
 # crosvm build with the hypervisor's backend; MODULES_DIR, the driver's .ko files; KERNEL and
-# DUMMY, the guest kernel and its read-only disk. The writable disk and state stay in
-# /data/misc/xkernel_vm, as etc/xkernel_vm.json says.
+# DUMMY, the guest kernel and its read-only disk; ROOTFS (optional), the template of the guest's
+# root file system, which the service copies to /data/misc/xkernel_vm on a first start. The
+# writable disk and state stay in /data/misc/xkernel_vm, as etc/xkernel_vm.json says.
 #
 # MONITOR_APK (optional, a signed APK on this host): the monitor app (OS之OS监控软件,
 # com.kylinos.monitor), installed as the privileged system app /system_ext/priv-app/KylinMonitor
@@ -38,7 +39,7 @@ REPO=$(cd "$HERE/../.." && pwd)
 ST=/data/local/tmp/xkvm-install
 
 device() {
-    adb -s "$SERIAL" shell "su 0 env CROSVM=${CROSVM:-} MODULES_DIR=${MODULES_DIR:-} KERNEL=${KERNEL:-} DUMMY=${DUMMY:-} sh $ST/on-device.sh $1"
+    adb -s "$SERIAL" shell "su 0 env CROSVM=${CROSVM:-} MODULES_DIR=${MODULES_DIR:-} KERNEL=${KERNEL:-} DUMMY=${DUMMY:-} ROOTFS=${ROOTFS:-} sh $ST/on-device.sh $1"
 }
 
 stage() {

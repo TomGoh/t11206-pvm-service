@@ -1,5 +1,6 @@
-//! The service, the loader, the init script and the property contexts name the same properties,
-//! and the product makefile installs the modules modules.load lists.
+//! The service, the loader, the init script and the property contexts name the same properties;
+//! the product makefile installs the modules modules.load lists, and the files the instance config
+//! names are where the product makefile and the prebuilts template install them.
 use std::fs;
 use xkernel_vm_service_host_tests::{driver, loader};
 
@@ -40,4 +41,31 @@ fn the_product_installs_the_listed_modules() {
         .take_while(|l| !l.is_empty())
         .collect();
     assert_eq!(installed, listed);
+}
+
+#[test]
+fn the_product_installs_what_the_config_names() {
+    let config: serde_json::Value =
+        serde_json::from_str(&repo_file("etc/xkernel_vm.json")).unwrap();
+    let mk = repo_file("product.mk");
+    let template = repo_file("product/prebuilts.bp.template");
+    let etc = "/system_ext/etc/xkernel_vm/";
+    // product.mk copies these names from the prebuilts directory to /system_ext/etc/xkernel_vm.
+    assert!(
+        mk.contains("$(foreach f,kernel.bin dummy.img rootfs.img,"),
+        "guest images in product.mk"
+    );
+    assert_eq!(config["kernel"], format!("{etc}kernel.bin"));
+    let disks = config["disks"].as_array().unwrap();
+    assert_eq!(disks[0]["path"], format!("{etc}dummy.img"));
+    assert_eq!(disks[1]["template"], format!("{etc}rootfs.img"));
+    // The template's cc_prebuilt_binary installs /system_ext/bin/<name>.
+    assert_eq!(config["direct"]["crosvm"], "/system_ext/bin/xkernel_crosvm");
+    for name in ["xkernel_crosvm", "KylinMonitor"] {
+        assert!(template.contains(&format!("name: \"{name}\"")), "{name} in the template");
+        assert!(mk.contains(&format!("    {name}")), "{name} in PRODUCT_PACKAGES");
+    }
+    assert!(template.contains("privileged: true"), "the monitor is a privileged app");
+    let contexts = repo_file("sepolicy/private/file_contexts");
+    assert!(contexts.contains("/system_ext/bin/xkernel_crosvm "), "crosvm label");
 }

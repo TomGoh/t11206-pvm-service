@@ -1,29 +1,46 @@
-# Include from the product makefile of a device whose host runs the XHyper driver.
+# Include from the product makefile of a device whose host runs the XHyper driver. Everything
+# goes to the system_ext partition; the vendor partition is not touched. product/README.md is the
+# integration guide for image builders.
 #
 # The instance config runs the VM with the direct backend: the service starts the crosvm build
-# with the hypervisor's backend itself, which the product installs as /system_ext/bin/xkernel_crosvm
-# (not part of this repository). Running it through AVF instead needs the Virtualization module's
-# support for declared firmware-less VMs, etc/xkernel_vm.avf.json as the config and
-# protected_vms_without_firmware_xkernel.xml in PRODUCT_PACKAGES.
+# with the hypervisor's backend itself (/system_ext/bin/xkernel_crosvm, a prebuilt). Running it
+# through AVF instead needs the Virtualization module's support for declared firmware-less VMs,
+# etc/xkernel_vm.avf.json as the config and protected_vms_without_firmware_xkernel.xml in
+# PRODUCT_PACKAGES.
+
+# Built from source: the service (it pulls in its launcher, driver loader, modules.load and init
+# script), its instance config, and the control app (repository t11206-pvm-app, which also
+# declares the permissions CONTROL_VM and READ_VM_STATS).
 PRODUCT_PACKAGES += \
     xkernel_vm_service \
-    xkernel_vmctl \
-    xkernel_vm.json
+    xkernel_vm.json \
+    XKernelVmControl
+
+# The shell client, for debugging builds only.
+PRODUCT_PACKAGES_DEBUG += xkernel_vmctl
 
 SYSTEM_EXT_PRIVATE_SEPOLICY_DIRS += $(dir $(lastword $(MAKEFILE_LIST)))sepolicy/private
 
-# The monitor app (OS之OS监控软件, com.kylinos.monitor) reads the service's read-only monitoring
-# interface with the permission READ_VM_STATS, which the control app declares
-# signature|privileged|development. Ship the monitor as a privileged app (priv-app, as the
-# StarKylinMonitor prebuilt was) and it holds the permission from boot with no grant step; no
-# privapp-permissions entry is needed, that allowlist covers only platform permissions. The
-# service loads the driver and starts the counters on the monitor's first read.
+# Everything that is not built from source comes from one directory the image build names in
+# XKERNEL_VM_PREBUILTS_DIR (it must be inside the source tree, as it holds an Android.bp):
+#
+#   modules/<each .ko of etc/modules.load>  the hypervisor host driver, built with the device's
+#                                           kernel; xkernel_vm_loader loads them on first use
+#   kernel.bin, dummy.img                   the guest kernel and its read-only disk
+#   rootfs.img                              the guest's root file system: the template the service
+#                                           copies to /data/misc/xkernel_vm on the first start
+#   xkernel_crosvm                          crosvm with the hypervisor's backend (statically linked)
+#   KylinMonitor.apk                        the monitor app (OS之OS监控软件, com.kylinos.monitor)
+#   Android.bp                              this repository's product/prebuilts.bp.template
+#
+# The Android.bp there turns xkernel_crosvm and KylinMonitor.apk into modules: an ELF under bin
+# and an app cannot go through PRODUCT_COPY_FILES. The monitor is a privileged app, which gives it
+# READ_VM_STATS from boot without a grant step (no privapp-permissions entry is needed: that
+# allowlist covers platform permissions only).
+ifeq ($(XKERNEL_VM_PREBUILTS_DIR),)
+$(error XKERNEL_VM_PREBUILTS_DIR must name the directory of the x-kernel VM prebuilts (see product/README.md))
+endif
 
-# The hypervisor host driver's modules, in the order of etc/modules.load. They are built with the
-# device's kernel and are not kept in this repository: the image build sets
-# XKERNEL_VM_MODULES_DIR to the directory holding them, and they are installed beside
-# modules.load in /system_ext/etc/xkernel_vm/modules, where xkernel_vm_loader loads them on the
-# first start after boot. (The ELF check of PRODUCT_COPY_FILES covers bin and lib paths only.)
 XKERNEL_VM_MODULES := \
     xhyper_hypercall.ko \
     xhyper.ko \
@@ -33,8 +50,11 @@ XKERNEL_VM_MODULES := \
     xhyper_irqfd.ko \
     xhyper_ioeventfd.ko
 
-ifeq ($(XKERNEL_VM_MODULES_DIR),)
-$(error XKERNEL_VM_MODULES_DIR must name the directory of the hypervisor driver modules ($(XKERNEL_VM_MODULES)))
-endif
+PRODUCT_PACKAGES += \
+    xkernel_crosvm \
+    KylinMonitor
+
+# Plain files under etc (the ELF check of PRODUCT_COPY_FILES covers bin and lib paths only).
 PRODUCT_COPY_FILES += \
-    $(foreach m,$(XKERNEL_VM_MODULES),$(XKERNEL_VM_MODULES_DIR)/$(m):$(TARGET_COPY_OUT_SYSTEM_EXT)/etc/xkernel_vm/modules/$(m))
+    $(foreach m,$(XKERNEL_VM_MODULES),$(XKERNEL_VM_PREBUILTS_DIR)/modules/$(m):$(TARGET_COPY_OUT_SYSTEM_EXT)/etc/xkernel_vm/modules/$(m)) \
+    $(foreach f,kernel.bin dummy.img rootfs.img,$(XKERNEL_VM_PREBUILTS_DIR)/$(f):$(TARGET_COPY_OUT_SYSTEM_EXT)/etc/xkernel_vm/$(f))
