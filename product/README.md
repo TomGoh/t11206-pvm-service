@@ -28,7 +28,7 @@
 1. 把 `t11206-pvm-service` 和 `t11206-pvm-app` 两个仓库放进与设备版本一致的 Android 源码树（目录位置不限）。
 2. 建一个预编译目录（必须在源码树里，因为里面要放 Android.bp），放入：
    - `modules/` 下的 7 个 `.ko`；
-   - `kernel.bin`、`dummy.img`、`rootfs.img`；
+   - `kernel.bin`、`dummy.img`、`rootfs.img`；放入 `rootfs.img` 前先运行 `guest/add-to-rootfs.sh rootfs.img`，把负载模拟工具 `xkload` 放进模板（见 `guest/README.md`）；
    - `xkernel_crosvm`；
    - `KylinMonitor.apk`（已签名）；
    - 把本目录的 `prebuilts.bp.template` 复制成 `Android.bp`。
@@ -84,6 +84,6 @@ dumpsys package com.kylinos.xkernelvm.control | grep codePath
 ## 六、还没验证或待定的地方
 
 - **强制模式：** 调试平板一直是宽容模式。策略通过了编译检查，在宽容模式下也没有我们这几个域的拒绝记录，但还没有在强制模式、user 版本上实际跑过。第一次出包请重点做第四节第 3 步。监视器自己读 `/proc/stat` 的“移动运行环境”一栏，在强制模式下可能被平台策略拒绝；这是应用原有的读法，与本次改动无关。
-- **根文件系统模板：** 必须是 x-kernel 交付的干净镜像。调试平板 `/data/misc/xkernel_vm/rootfs.img`（1 GiB ext4，sha256 `c5b18fe4…686a`）已经被客户机写过，不能直接当模板。模板会占 system_ext 分区约 1 GiB。
+- **根文件系统模板：** 必须是 x-kernel 交付的干净镜像。调试平板 `/data/misc/xkernel_vm/rootfs.img`（1 GiB ext4，sha256 `c5b18fe4…686a`）已经被客户机写过，不能直接当模板。模板会占 system_ext 分区约 1 GiB。调试平板上的模板已经加了 `xkload`（`968b0bb9…`）。
 - **虚拟化层：** 本文只管 Android 一侧。启动镜像里的 XHyper 要带 EL2 监视功能和受保护虚拟机支持；它和宿主内核、AVB 密钥属于启动镜像的另一条打包线。
 - **参考输入（调试平板 T11206HXH6600007 上验证过的组合）：** crosvm `0ac2449b…c2f2`，`kernel.bin` `d36aa46b…0360`，`dummy.img` `2daeb1f3…3e74`；驱动模块与内核 `5.15.178-android13-8-850930-g0ccc9d9bc3b7` 匹配，模块的校验和见实施记录。

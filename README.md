@@ -64,6 +64,7 @@ x-kernel 虚拟机的原生控制服务。它是这台设备上 x-kernel 虚拟�
 | `src/console.rs` | 串口控制台：每个实例的输入输出管道、输出历史与推送。 |
 | `src/service.rs` | `IXKernelVmControl` 与 `IXKernelVmMonitor` 的 Binder 实现与调用方校验。 |
 | `src/monitor.rs` | 监视接口的数据：EL2 周期计数的启停与读取、x-kernel 虚拟机进程的处理器时间。 |
+| `guest/` | 客户机里用的工具：负载模拟 `xkload.sh`，以及把它放进根文件系统模板的 `add-to-rootfs.sh`（`debugfs`，不需要 root）；说明见其 `README.md`。 |
 | `product/` | 给做镜像的同事：集成说明 `README.md`，以及预编译目录用的 Android.bp 模板（crosvm、监视器应用）。 |
 | `ctl/main.rs` | 命令行客户端 `xkernel_vmctl status|start|stop|watch|console|monitor`。 |
 | `etc/` | 实例配置（`xkernel_vm.json` 为直接后端，`xkernel_vm.avf.json` 为经 AVF）、AVF 声明、init 脚本。 |
