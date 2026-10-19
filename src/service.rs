@@ -12,11 +12,18 @@
 //! output and subscribes the client to the rest, and writing types into the running guest. The
 //! console gives full control of the guest's shell, which is why it needs the same permission as
 //! starting and stopping. Console contents are never logged.
+//!
+//! `IXKernelVmMonitor` is registered separately and is read-only: the hypervisor's EL2 cycles per
+//! CPU and the VM's CPU time (see `monitor`). Monitor apps get it without control: callers must
+//! be uid 0 or 1000, or hold [`READ_STATS_PERMISSION`] or [`CONTROL_PERMISSION`]. The figures are
+//! system-wide CPU accounting, which platform policy keeps from ordinary apps (`/proc/stat`), so
+//! the interface is not open to every app either.
 
 use crate::config::{BackendKind, Protection, VmConfig};
 use crate::console::{self, Console, InputError, Listener, SendError, MAX_INPUT};
 use crate::controller::{Backend, Controller};
 use crate::machine::{Refused, Snapshot, VmState};
+use crate::monitor::{self, El2Monitor, El2Reading, VmProcesses};
 use android_os_permissions_aidl::aidl::android::os::IPermissionController::IPermissionController;
 use binder::{
     DeathRecipient, ExceptionCode, IBinder, Interface, Result as BinderResult, SpIBinder, Status,
@@ -26,19 +33,28 @@ use com_kylinos_xkernelvm::aidl::com::kylinos::xkernelvm::{
     ConsoleOutput::ConsoleOutput,
     IXKernelVmCallback::IXKernelVmCallback,
     IXKernelVmConsoleCallback::IXKernelVmConsoleCallback,
+    El2Counters::El2Counters,
+    El2CycleSample::El2CycleSample,
     IXKernelVmControl::{
         IXKernelVmControl, ERROR_BUSY, ERROR_NOT_RUNNING, ERROR_RECLAIM_PENDING, ERROR_UNAVAILABLE,
     },
+    IXKernelVmMonitor::{IXKernelVmMonitor, EL2_COUNTING, EL2_UNAVAILABLE},
+    VmCpuTime::VmCpuTime,
     VmState::VmState as AidlVmState,
     VmStatus::VmStatus,
 };
 use log::{info, warn};
+use std::path::PathBuf;
 use std::sync::{Arc, Mutex, Weak};
 
 /// The servicemanager name of the control interface.
 pub const SERVICE_NAME: &str = "com.kylinos.xkernelvm.IXKernelVmControl/default";
 /// The permission that lets an app use the control interface.
 pub const CONTROL_PERMISSION: &str = "com.kylinos.xkernelvm.permission.CONTROL_VM";
+/// The servicemanager name of the monitoring interface.
+pub const MONITOR_SERVICE_NAME: &str = "com.kylinos.xkernelvm.IXKernelVmMonitor/default";
+/// The permission that lets an app read the monitoring interface (and nothing else).
+pub const READ_STATS_PERMISSION: &str = "com.kylinos.xkernelvm.permission.READ_VM_STATS";
 
 const AID_ROOT: u32 = 0;
 const AID_SYSTEM: u32 = 1000;
@@ -285,20 +301,26 @@ impl<B: Backend> ControlService<B> {
 impl<B: Backend> Interface for ControlService<B> {}
 
 fn check_caller() -> BinderResult<()> {
+    check_permission(&[CONTROL_PERMISSION])
+}
+
+/// Admits uid 0 and 1000, and callers holding one of `permissions`.
+fn check_permission(permissions: &[&str]) -> BinderResult<()> {
     let uid = ThreadState::get_calling_uid();
     if uid == AID_ROOT || uid == AID_SYSTEM {
         return Ok(());
     }
     let pid = ThreadState::get_calling_pid();
     let permission: Strong<dyn IPermissionController> = binder::wait_for_interface("permission")?;
-    if permission.checkPermission(CONTROL_PERMISSION, pid, uid as i32)? {
-        Ok(())
-    } else {
-        Err(Status::new_exception_str(
-            ExceptionCode::SECURITY,
-            Some(format!("uid {uid} does not hold {CONTROL_PERMISSION}")),
-        ))
+    for name in permissions {
+        if permission.checkPermission(name, pid, uid as i32)? {
+            return Ok(());
+        }
     }
+    Err(Status::new_exception_str(
+        ExceptionCode::SECURITY,
+        Some(format!("uid {uid} does not hold {}", permissions.join(" or "))),
+    ))
 }
 
 fn refused(refused: Refused) -> Status {
@@ -362,5 +384,72 @@ impl<B: Backend> IXKernelVmControl for ControlService<B> {
     fn writeConsole(&self, data: &[u8]) -> BinderResult<()> {
         check_caller()?;
         self.console.write(data)
+    }
+}
+
+/// The `IXKernelVmMonitor` implementation. Read-only: it never changes the VM, and it takes only
+/// the controller's short-held locks.
+pub struct MonitorService<B: Backend> {
+    controller: Controller<B>,
+    el2: Arc<El2Monitor>,
+    processes: VmProcesses,
+    proc_root: PathBuf,
+    ticks_per_sec: u64,
+}
+
+impl<B: Backend> MonitorService<B> {
+    pub fn new(
+        controller: Controller<B>,
+        el2: Arc<El2Monitor>,
+        processes: VmProcesses,
+        proc_root: PathBuf,
+    ) -> Self {
+        Self { controller, el2, processes, proc_root, ticks_per_sec: monitor::ticks_per_sec() }
+    }
+}
+
+impl<B: Backend> Interface for MonitorService<B> {}
+
+fn check_reader() -> BinderResult<()> {
+    check_permission(&[READ_STATS_PERMISSION, CONTROL_PERMISSION])
+}
+
+impl<B: Backend> IXKernelVmMonitor for MonitorService<B> {
+    fn getEl2Counters(&self) -> BinderResult<El2Counters> {
+        check_reader()?;
+        Ok(match self.el2.read() {
+            El2Reading::Counting(samples) => El2Counters {
+                status: EL2_COUNTING,
+                reason: String::new(),
+                samples: samples
+                    .iter()
+                    .map(|s| El2CycleSample {
+                        cpu: s.cpu as i32,
+                        cycles: s.cycles as i64,
+                        timestampNs: s.timestamp_ns as i64,
+                    })
+                    .collect(),
+            },
+            El2Reading::Unavailable(reason) => {
+                El2Counters { status: EL2_UNAVAILABLE, reason, samples: Vec::new() }
+            }
+        })
+    }
+
+    fn getVmCpuTime(&self) -> BinderResult<VmCpuTime> {
+        check_reader()?;
+        // Recorded processes belong to the latest instance: a new start needs the last one
+        // confirmed gone, which clears them.
+        let instance = self.controller.snapshot().generation;
+        let processes = self.processes.get(instance, &self.controller.processes());
+        Ok(match monitor::vm_cpu_time(&self.proc_root, &processes, self.ticks_per_sec) {
+            Some(cpu_time_ns) => VmCpuTime {
+                running: true,
+                instance: instance as i64,
+                cpuTimeNs: cpu_time_ns as i64,
+                timestampNs: monitor::monotonic_ns() as i64,
+            },
+            None => VmCpuTime::default(),
+        })
     }
 }

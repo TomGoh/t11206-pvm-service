@@ -187,6 +187,12 @@ impl<B: Backend> Controller<B> {
     pub fn request_stop(&self) -> u64 {
         self.inner.transition(|m| Ok::<_, Refused>(m.request_stop())).unwrap_or(0)
     }
+
+    /// The crosvm processes recorded at the start of the current or last instance; empty once
+    /// that instance is confirmed gone. Read by the monitoring interface.
+    pub fn processes(&self) -> Vec<TrackedProcess> {
+        self.inner.tracked.lock().unwrap().clone()
+    }
 }
 
 impl<B: Backend> Inner<B> {

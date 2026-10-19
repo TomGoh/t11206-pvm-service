@@ -17,7 +17,8 @@ on post-fs-data
 # Loads the hypervisor's host driver when the service asks: a start that finds /dev/xhyper
 # missing (the first one after boot) writes a new request number (src/driver.rs). The loader
 # loads /system_ext/etc/xkernel_vm/modules in the order of its modules.load, makes /dev/xhyper
-# 0666 root root and writes the result to xkernel_vm.driver_status (loader/main.rs).
+# 0666 root root and /proc/xcore_stats 0660 root system, and writes the result to
+# xkernel_vm.driver_status (loader/main.rs).
 service xkernel_vm_loader /system_ext/bin/xkernel_vm_loader
     user root
     group root

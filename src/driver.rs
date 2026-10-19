@@ -14,6 +14,11 @@
 //! The service never loads modules itself: platform policy gives module loading only to
 //! dedicated domains, and a service that answers apps should not hold that right. The property
 //! names are also in `loader/main.rs` and the init script.
+//!
+//! A start and the monitoring interface (`monitor`) may both need the driver; one loader serves
+//! both and handles one request at a time. A second request while the loader runs would be lost:
+//! init does not start a oneshot service again while it runs, so that request would never get a
+//! result. A caller that waited for the other's load finds the node and asks for nothing.
 
 use crate::config::exists_without_stat;
 use crate::controller::Backend;
@@ -21,6 +26,7 @@ use crate::machine::Exit;
 use log::info;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::{Duration, Instant};
 
@@ -40,15 +46,22 @@ pub struct DriverLoader {
     set: SetProperty,
     get: GetProperty,
     requests: AtomicU64,
+    /// Held for a whole load, so that only one request is outstanding.
+    loading: Mutex<()>,
 }
 
 impl DriverLoader {
     pub fn new(device: PathBuf, timeout: Duration, set: SetProperty, get: GetProperty) -> Self {
-        Self { device, timeout, set, get, requests: AtomicU64::new(0) }
+        Self { device, timeout, set, get, requests: AtomicU64::new(0), loading: Mutex::new(()) }
     }
 
     /// Returns once the device node is there, asking for a load if it is not.
     pub fn ensure_loaded(&self) -> Result<(), String> {
+        if exists_without_stat(&self.device) {
+            return Ok(());
+        }
+        let _loading = self.loading.lock().unwrap();
+        // Another caller may have loaded it while this one waited.
         if exists_without_stat(&self.device) {
             return Ok(());
         }
@@ -97,11 +110,11 @@ impl DriverLoader {
 /// A backend that makes sure the driver is loaded before the inner backend starts the VM.
 pub struct WithDriver<B> {
     inner: B,
-    loader: Option<DriverLoader>,
+    loader: Option<Arc<DriverLoader>>,
 }
 
 impl<B> WithDriver<B> {
-    pub fn new(inner: B, loader: Option<DriverLoader>) -> Self {
+    pub fn new(inner: B, loader: Option<Arc<DriverLoader>>) -> Self {
         Self { inner, loader }
     }
 }
@@ -126,7 +139,6 @@ mod tests {
     use super::*;
     use std::collections::HashMap;
     use std::fs;
-    use std::sync::{Arc, Mutex};
 
     type Props = Arc<Mutex<HashMap<String, String>>>;
 
@@ -226,6 +238,40 @@ mod tests {
         let err = loader.ensure_loaded().unwrap_err();
         assert!(err.contains("did not load within"), "{err}");
         assert!(started.elapsed() >= Duration::from_millis(300));
+    }
+
+    #[test]
+    fn concurrent_callers_share_one_request() {
+        let rig = Rig::new("concurrent");
+        let requests = Arc::new(Mutex::new(Vec::new()));
+        let busy = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let seen = requests.clone();
+        let loader = Arc::new(rig.loader(1000, move |device, props, request| {
+            seen.lock().unwrap().push(request.to_string());
+            // Like init: a oneshot service that still runs is not started again, so a request
+            // made meanwhile gets no result.
+            if busy.swap(true, Ordering::SeqCst) {
+                return;
+            }
+            let (device, props, request) = (device.clone(), props.clone(), request.to_string());
+            let busy = busy.clone();
+            thread::spawn(move || {
+                thread::sleep(Duration::from_millis(200));
+                fs::write(&device, b"").unwrap();
+                status(&props, format!("loaded {request}"));
+                busy.store(false, Ordering::SeqCst);
+            });
+        }));
+        let both = Arc::new(std::sync::Barrier::new(2));
+        let (other, gate) = (loader.clone(), both.clone());
+        let waiter = thread::spawn(move || {
+            gate.wait();
+            other.ensure_loaded()
+        });
+        both.wait();
+        assert_eq!(loader.ensure_loaded(), Ok(()));
+        assert_eq!(waiter.join().unwrap(), Ok(()));
+        assert_eq!(requests.lock().unwrap().len(), 1);
     }
 
     #[test]

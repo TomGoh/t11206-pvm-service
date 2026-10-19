@@ -1,0 +1,2 @@
+# The host driver's EL2 cycle counters (src/monitor.rs).
+genfscon proc /xcore_stats u:object_r:proc_xcore_stats:s0

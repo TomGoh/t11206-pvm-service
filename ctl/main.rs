@@ -1,7 +1,8 @@
 // Copyright 2026 KylinSoft Co., Ltd.
 // SPDX-License-Identifier: Apache-2.0
 
-//! `xkernel_vmctl`: a shell client of `IXKernelVmControl`, for tests and diagnosis.
+//! `xkernel_vmctl`: a shell client of `IXKernelVmControl` and `IXKernelVmMonitor`, for tests and
+//! diagnosis.
 //!
 //! ```text
 //! xkernel_vmctl status
@@ -9,10 +10,18 @@
 //! xkernel_vmctl stop  [--wait SECONDS]   # waits for STOPPED/FAILED/RECLAIM_UNKNOWN
 //! xkernel_vmctl watch [--wait SECONDS]   # prints every change
 //! xkernel_vmctl console [--new-only] [--send TEXT [--raw]] [--follow SECONDS]
+//! xkernel_vmctl monitor [--count N] [--interval-ms MS]
 //! ```
 //!
 //! `console` prints the serial console output the service kept (unless `--new-only`), then types
 //! TEXT into the guest (with a newline unless `--raw`), then prints new output for SECONDS.
+//!
+//! `monitor` reads the monitoring interface N times and prints each reading as two lines, raw:
+//!
+//! ```text
+//! el2 COUNTING <cpu>:<cycles>:<timestamp_ns> ...      or   el2 UNAVAILABLE <reason>
+//! vm running=<bool> instance=<n> cpu_time_ns=<ns> timestamp_ns=<ns>
+//! ```
 //!
 //! The exit status is 0 when the awaited state is reached (for `console`: the input was taken)
 //! and 1 otherwise, so scripts can rely on it.
@@ -25,6 +34,7 @@ use com_kylinos_xkernelvm::aidl::com::kylinos::xkernelvm::{
     IXKernelVmCallback::{BnXKernelVmCallback, IXKernelVmCallback},
     IXKernelVmConsoleCallback::{BnXKernelVmConsoleCallback, IXKernelVmConsoleCallback},
     IXKernelVmControl::IXKernelVmControl,
+    IXKernelVmMonitor::{IXKernelVmMonitor, EL2_COUNTING},
     VmState::VmState,
     VmStatus::VmStatus,
 };
@@ -34,6 +44,7 @@ use std::sync::Mutex;
 use std::time::{Duration, Instant};
 
 const SERVICE_NAME: &str = "com.kylinos.xkernelvm.IXKernelVmControl/default";
+const MONITOR_SERVICE_NAME: &str = "com.kylinos.xkernelvm.IXKernelVmMonitor/default";
 
 #[derive(Parser)]
 struct Args {
@@ -70,6 +81,45 @@ enum Command {
         #[arg(long, default_value_t = 0)]
         follow: u64,
     },
+    Monitor {
+        /// Readings to take.
+        #[arg(long, default_value_t = 1)]
+        count: u32,
+        /// Milliseconds between readings.
+        #[arg(long, default_value_t = 1000)]
+        interval_ms: u64,
+    },
+}
+
+/// Prints `count` readings of the monitoring interface as `monitor` in the module documentation
+/// describes; returns whether every EL2 reading was counting.
+fn monitor(count: u32, interval: Duration) -> Result<bool> {
+    let service: Strong<dyn IXKernelVmMonitor> =
+        binder::wait_for_interface(MONITOR_SERVICE_NAME).context("monitor service not found")?;
+    let mut counting = true;
+    for i in 0..count {
+        if i > 0 {
+            std::thread::sleep(interval);
+        }
+        let el2 = service.getEl2Counters().context("getEl2Counters")?;
+        if el2.status == EL2_COUNTING {
+            let samples: Vec<String> = el2
+                .samples
+                .iter()
+                .map(|s| format!("{}:{}:{}", s.cpu, s.cycles, s.timestampNs))
+                .collect();
+            println!("el2 COUNTING {}", samples.join(" "));
+        } else {
+            counting = false;
+            println!("el2 UNAVAILABLE {}", el2.reason);
+        }
+        let vm = service.getVmCpuTime().context("getVmCpuTime")?;
+        println!(
+            "vm running={} instance={} cpu_time_ns={} timestamp_ns={}",
+            vm.running, vm.instance, vm.cpuTimeNs, vm.timestampNs
+        );
+    }
+    Ok(counting)
 }
 
 struct Callback(Mutex<Sender<VmStatus>>);
@@ -246,6 +296,10 @@ fn follow(
 fn main() -> Result<()> {
     let args = Args::parse();
     ProcessState::start_thread_pool();
+    if let Command::Monitor { count, interval_ms } = args.command {
+        let ok = monitor(count, Duration::from_millis(interval_ms))?;
+        std::process::exit(if ok { 0 } else { 1 });
+    }
     let service: Strong<dyn IXKernelVmControl> =
         binder::wait_for_interface(SERVICE_NAME).context("control service not found")?;
     let ok = match args.command {
@@ -277,6 +331,7 @@ fn main() -> Result<()> {
         Command::Console { new_only, send, raw, follow } => {
             console(&service, new_only, send, raw, Duration::from_secs(follow))?
         }
+        Command::Monitor { .. } => unreachable!("handled before the control service is needed"),
     };
     std::process::exit(if ok { 0 } else { 1 });
 }

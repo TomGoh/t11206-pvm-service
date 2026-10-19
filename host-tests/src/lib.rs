@@ -12,5 +12,7 @@ pub mod driver;
 pub mod loader;
 #[path = "../../src/machine.rs"]
 pub mod machine;
+#[path = "../../src/monitor.rs"]
+pub mod monitor;
 #[path = "../../src/reclaim.rs"]
 pub mod reclaim;

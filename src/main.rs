@@ -20,6 +20,9 @@
 //!
 //! The instance config chooses who runs crosvm: AVF (`avf`), or this service itself (`direct`),
 //! for products that may not change AVF. Everything else is the same for both.
+//!
+//! A second, read-only interface, `IXKernelVmMonitor`, gives monitor apps the hypervisor's EL2
+//! cycles per CPU and the VM's CPU time (see `monitor`).
 
 mod avf;
 mod config;
@@ -28,6 +31,7 @@ mod controller;
 mod direct;
 mod driver;
 mod machine;
+mod monitor;
 mod reclaim;
 mod service;
 
@@ -37,16 +41,22 @@ use crate::console::Console;
 use crate::controller::{Backend, Controller, Settings};
 use crate::direct::DirectBackend;
 use crate::driver::{DriverLoader, WithDriver};
-use crate::service::{Callbacks, ConsoleClients, ControlService, SERVICE_NAME};
+use crate::monitor::{El2Monitor, EnsureDriver, ProcFile, VmProcesses, XCORE_STATS};
+use crate::service::{
+    Callbacks, ConsoleClients, ControlService, MonitorService, MONITOR_SERVICE_NAME, SERVICE_NAME,
+};
 use anyhow::{Context, Result};
 use binder::{BinderFeatures, ProcessState};
 use clap::Parser;
-use com_kylinos_xkernelvm::aidl::com::kylinos::xkernelvm::IXKernelVmControl::BnXKernelVmControl;
+use com_kylinos_xkernelvm::aidl::com::kylinos::xkernelvm::{
+    IXKernelVmControl::BnXKernelVmControl, IXKernelVmMonitor::BnXKernelVmMonitor,
+};
 use log::{error, info, LevelFilter};
 use nix::time::{clock_gettime, ClockId};
 use rustutils::system_properties;
 use std::path::{Path, PathBuf};
-use std::time::Duration;
+use std::sync::Arc;
+use std::time::{Duration, Instant};
 
 const DEFAULT_CONFIG: &str = "/system_ext/etc/xkernel_vm/xkernel_vm.json";
 
@@ -78,30 +88,45 @@ fn try_main() -> Result<()> {
     info!("instance config {}: {config:?}", args.config.display());
 
     let console = Console::new();
-    // Loads the hypervisor driver on a start that finds its device node missing.
+    // Loads the hypervisor driver on a start that finds its device node missing, and for the
+    // EL2 monitor.
     let driver = config.driver.as_ref().map(|d| {
-        DriverLoader::new(
+        Arc::new(DriverLoader::new(
             config.hypervisor_device.clone(),
             Duration::from_secs(d.timeout_seconds),
             Box::new(|name, value| system_properties::write(name, value).map_err(|e| format!("{e:#}"))),
             Box::new(|name| system_properties::read(name).ok().flatten()),
-        )
+        ))
     });
+    let ensure_driver = driver.clone().map(|d| Box::new(move || d.ensure_loaded()) as EnsureDriver);
+    let started = Instant::now();
+    let el2 = Arc::new(El2Monitor::new(
+        Box::new(ProcFile(PathBuf::from(XCORE_STATS))),
+        ensure_driver,
+        Box::new(move || started.elapsed()),
+    ));
+    el2.reset();
+    el2.spawn_idle_stopper();
     match config.backend {
         BackendKind::Avf => {
             let backend = AvfBackend::new(config.clone(), console.clone())
                 .context("Can't prepare the AVF backend")?;
-            serve(config, WithDriver::new(backend, driver), console)
+            serve(config, WithDriver::new(backend, driver), console, el2)
         }
         BackendKind::Direct => {
             let backend = DirectBackend::new(config.clone(), console.clone())
                 .context("Can't prepare the direct backend")?;
-            serve(config, WithDriver::new(backend, driver), console)
+            serve(config, WithDriver::new(backend, driver), console, el2)
         }
     }
 }
 
-fn serve<B: Backend>(config: VmConfig, backend: B, console: std::sync::Arc<Console>) -> Result<()> {
+fn serve<B: Backend>(
+    config: VmConfig,
+    backend: B,
+    console: Arc<Console>,
+    el2: Arc<El2Monitor>,
+) -> Result<()> {
     let boot_id = boot_id();
     let session_id = format!("{boot_id}/{}/{}", std::process::id(), boot_time_ms());
     let callbacks = Callbacks::new(&config, session_id);
@@ -133,6 +158,16 @@ fn serve<B: Backend>(config: VmConfig, backend: B, console: std::sync::Arc<Conso
     let controller = Controller::new(backend, settings, preflight, publish, Box::new(boot_time_ms));
     info!("initial status: {:?}", controller.status());
 
+    let started = Instant::now();
+    let processes = VmProcesses::new(
+        PathBuf::from("/proc"),
+        config.crosvm_process_name(),
+        Box::new(move || started.elapsed()),
+    );
+    let monitor = BnXKernelVmMonitor::new_binder(
+        MonitorService::new(controller.clone(), el2, processes, PathBuf::from("/proc")),
+        BinderFeatures::default(),
+    );
     let service = BnXKernelVmControl::new_binder(
         ControlService::new(controller, callbacks, ConsoleClients::new(console)),
         BinderFeatures::default(),
@@ -140,6 +175,9 @@ fn serve<B: Backend>(config: VmConfig, backend: B, console: std::sync::Arc<Conso
     binder::add_service(SERVICE_NAME, service.as_binder())
         .with_context(|| format!("Can't register {SERVICE_NAME}"))?;
     info!("registered {SERVICE_NAME}");
+    binder::add_service(MONITOR_SERVICE_NAME, monitor.as_binder())
+        .with_context(|| format!("Can't register {MONITOR_SERVICE_NAME}"))?;
+    info!("registered {MONITOR_SERVICE_NAME}");
     ProcessState::join_thread_pool();
     anyhow::bail!("the Binder thread pool ended")
 }

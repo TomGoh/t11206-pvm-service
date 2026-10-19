@@ -1,6 +1,6 @@
 # t11206-pvm-service
 
-x-kernel 虚拟机的原生控制服务。它是这台设备上 x-kernel 虚拟机的唯一持有者：把 x-kernel 作为**不带客户机固件的受保护虚拟机**创建、启动和停止（首选自己运行 crosvm，也可以经 AVF），并通过 Binder 接口 `IXKernelVmControl` 把这些操作和真实状态提供给控制应用和命令行工具。
+x-kernel 虚拟机的原生控制服务。它是这台设备上 x-kernel 虚拟机的唯一持有者：把 x-kernel 作为**不带客户机固件的受保护虚拟机**创建、启动和停止（首选自己运行 crosvm，也可以经 AVF），并通过 Binder 接口 `IXKernelVmControl` 把这些操作和真实状态提供给控制应用和命令行工具；另一个只读接口 `IXKernelVmMonitor` 给监视器应用提供虚拟化层每核的 EL2 周期数和 x-kernel 虚拟机的处理器时间。
 
 ## 行为约定
 
@@ -25,9 +25,18 @@ x-kernel 虚拟机的原生控制服务。它是这台设备上 x-kernel 虚拟�
 
 ## 宿主驱动按需加载
 
-开机时不加载宿主驱动，设备在有人启动虚拟机之前与原来一样。配置里有 `driver` 时，启动发现 `/dev/xhyper` 不存在（开机后的第一次启动），服务就向属性 `xkernel_vm.load_driver` 写入一个新的请求号；init 脚本据此启动 `xkernel_vm_loader`，它按 `/system_ext/etc/xkernel_vm/modules/modules.load` 的顺序加载同一目录里的模块（已加载的跳过），等到设备节点出现，设为 0666 root root（与 AOSP 的 `/dev/kvm` 相同，由 SELinux 限定只有 crosvm 域能打开），再把 `loaded <请求号>` 或 `failed <请求号>: <原因>` 写到 `xkernel_vm.driver_status`；服务等到这个结果再启动虚拟机，超过 `driver.timeout_seconds` 算失败。服务自己不加载模块：平台策略只把加载模块的权限给专门的域，回答应用请求的服务不应持有它。
+开机时不加载宿主驱动，设备在有人启动虚拟机之前与原来一样。配置里有 `driver` 时，启动发现 `/dev/xhyper` 不存在（开机后的第一次启动），服务就向属性 `xkernel_vm.load_driver` 写入一个新的请求号；init 脚本据此启动 `xkernel_vm_loader`，它按 `/system_ext/etc/xkernel_vm/modules/modules.load` 的顺序加载同一目录里的模块（已加载的跳过），等到设备节点出现，设为 0666 root root（与 AOSP 的 `/dev/kvm` 相同，由 SELinux 限定只有 crosvm 域能打开），把驱动的 EL2 周期计数文件 `/proc/xcore_stats` 设为 0660 root system（供下节的监视接口使用；驱动没有这个文件或设置失败只记日志），再把 `loaded <请求号>` 或 `failed <请求号>: <原因>` 写到 `xkernel_vm.driver_status`；服务等到这个结果再启动虚拟机，超过 `driver.timeout_seconds` 算失败。服务自己不加载模块：平台策略只把加载模块的权限给专门的域，回答应用请求的服务不应持有它。
 
 模块文件（`.ko`）要与设备的内核一致，随宿主驱动的构建交付，不放在本仓库：做镜像时设置 `XKERNEL_VM_MODULES_DIR` 指向放模块的目录，`product.mk` 把 `etc/modules.load` 列出的模块装到 `/system_ext/etc/xkernel_vm/modules/`（不设置就构建报错）；本仓库带加载顺序 `etc/modules.load`。设备节点的类型 `xhyper_device` 和标签也在本仓库的 system_ext 策略里，因为驱动随本包交付，而不是随厂商分区。若产品改由厂商分区交付驱动（例如 vendor_dlkm），类型、标签和权限就应改由厂商策略和厂商的 ueventd 规则给出。
+
+## 只读监视接口
+
+`IXKernelVmMonitor`（服务名 `com.kylinos.xkernelvm.IXKernelVmMonitor/default`）给监视器应用提供两组累计值，速率由客户端用两次读数算出，服务不为客户端保存状态：
+
+- `getEl2Counters()`：每个在线核在 EL2 用掉的周期数和读数时刻，代读宿主驱动的 `/proc/xcore_stats`。第一次取数时启动计数（需要时先按上节方式加载驱动）；某个核的读数消失或读取失败时重新写 1，至多每 5 秒一次；15 秒没有人取数就写 0 停止计数，把 PMU 还给宿主；服务启动时也停一次，收回上一个服务实例可能留下的计数。周期数按核当时的频率计数，换算成时间要用核实际运行的频率（监视器应用取 cpufreq 的 `time_in_state`）。
+- `getVmCpuTime()`：x-kernel 虚拟机全部 crosvm 进程（启动时记录的，加上按进程名 `crosvm_<name>` 扫描到的，扫描结果保留 5 秒）的 utime + stime 之和。crosvm 在启动后才派生运行虚拟处理器的子进程，直接后端的启动又在启动器执行 crosvm 之前就返回，所以只靠启动时的记录会漏掉它们。x-kernel 的虚拟处理器由宿主线程代为调度，客户机运行的时间就记在这些线程上，其中也包含虚拟化层替它处理异常的时间和 crosvm 的设备模拟时间。
+
+调用方须是 root、system，或持有 `com.kylinos.xkernelvm.permission.READ_VM_STATS`（或控制权限）。这些是系统级的处理器占用数据，平台策略不让普通应用读 `/proc/stat` 一类数据，所以接口不对所有应用开放。权限由控制应用声明，保护级别 `signature|privileged|development`：平台签名或获准的特权应用自动获得，调试设备上用 `pm grant <包名> com.kylinos.xkernelvm.permission.READ_VM_STATS` 授予。SELinux 上监视接口的类型带 `app_api_service` 属性，应用可以查到并调用；`/proc/xcore_stats` 有自己的标签 `proc_xcore_stats`，只有服务能读写、加载程序能改属主。命令行 `xkernel_vmctl monitor [--count N] [--interval-ms MS]` 打印原始读数。
 
 ## 经 AVF 时
 
@@ -44,10 +53,11 @@ x-kernel 虚拟机的原生控制服务。它是这台设备上 x-kernel 虚拟�
 | `src/avf.rs` | AVF 后端（`libvmclient`）。 |
 | `src/direct.rs` | 不经 AVF 的后端：自己运行 crosvm、停止与强制结束、退出码解释。 |
 | `src/console.rs` | 串口控制台：每个实例的输入输出管道、输出历史与推送。 |
-| `src/service.rs` | `IXKernelVmControl` 的 Binder 实现与调用方校验。 |
-| `ctl/main.rs` | 命令行客户端 `xkernel_vmctl status|start|stop|watch|console`。 |
+| `src/service.rs` | `IXKernelVmControl` 与 `IXKernelVmMonitor` 的 Binder 实现与调用方校验。 |
+| `src/monitor.rs` | 监视接口的数据：EL2 周期计数的启停与读取、x-kernel 虚拟机进程的处理器时间。 |
+| `ctl/main.rs` | 命令行客户端 `xkernel_vmctl status|start|stop|watch|console|monitor`。 |
 | `etc/` | 实例配置（`xkernel_vm.json` 为直接后端，`xkernel_vm.avf.json` 为经 AVF）、AVF 声明、init 脚本。 |
-| `sepolicy/` | system_ext 策略：服务的域、接口、数据目录；启动器转入 `crosvm` 域、crosvm 程序本身的类型；加载程序的域、模块文件、驱动属性；设备节点 `xhyper_device`（只有 crosvm 域能打开）。 |
+| `sepolicy/` | system_ext 策略：服务的域、两个接口（监视接口应用可查到）、数据目录、`/proc/xcore_stats` 的标签（`genfs_contexts`）；启动器转入 `crosvm` 域、crosvm 程序本身的类型；加载程序的域、模块文件、驱动属性；设备节点 `xhyper_device`（只有 crosvm 域能打开）。 |
 | `src/driver.rs` | 按需加载宿主驱动：请求、等待结果。 |
 | `launcher/` | `xkernel_crosvm_launcher`：进入 `crosvm` 域后重新设置父进程死亡信号，再执行 crosvm。 |
 | `loader/` | `xkernel_vm_loader`：按 `modules.load` 加载模块、准备设备节点、报告结果（逻辑在 `loader.rs`，可在开发机测试）。 |
@@ -68,3 +78,5 @@ x-kernel 虚拟机的原生控制服务。它是这台设备上 x-kernel 虚拟�
 - 就绪：产品配置以串口输出里出现客户机的 shell 提示符 `kylin-x:~#` 作为就绪信号（`readiness.console_marker`），客户机不需要任何改动；提示符变了要同步改配置。也可以用 vsock 端口（`readiness.vsock_port`），但需要客户机监听，且在 SELinux 下只有经 AVF 时能用（平台策略只允许 AVF 的管理进程用 vsock）。没有配置时实例停在“运行中，服务未就绪”。
 - 无固件模式不经固件认证镜像，也不传递 DICE 身份；宿主复位时不清理该虚拟机内存（与带固件路径不同）。
 - 直接后端：crosvm 二进制要由产品另行安装（示例配置假定在 `/system_ext/bin/xkernel_crosvm`），本仓库不带这个预编译文件；平台策略只允许 AVF 的 `crosvm` 域打开 `/dev/vhost-vsock` 和虚拟机管理设备，所以 crosvm 由服务转入这个域运行；服务的就绪握手不能用服务自己发起的 vsock 连接（平台策略只允许 AVF 的管理进程、adbd 和 traced 用 vsock）；配置里没有 `launcher` 时，crosvm 直接由服务启动，转入 `crosvm` 域后父进程死亡信号被清除，服务被杀死后只有 init 结束进程组这一层保护；这个 crosvm 版本在 vCPU 出错后也以 33 退出，结束原因会被记成“客户机关机”。
+- 监视接口给出的 x-kernel 处理器时间是宿主上 crosvm 进程的时间：分不出客户机自己运行、虚拟化层替它处理异常和 crosvm 设备模拟各占多少，也分不出它在哪个物理核上运行；要按物理核拆分，只能由虚拟化层按虚拟机分别计时。
+- 直接后端的启动在启动器执行 crosvm 之前就返回，所以启动后立即按进程名查找时找不到 crosvm（日志“no crosvm_xkernel_vm process found right after the start”），`instance.json` 里的进程记录为空。回收核实和监视接口另外按进程名扫描，不受影响；服务重启后核实上一轮进程也靠扫描。

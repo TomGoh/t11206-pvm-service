@@ -15,6 +15,22 @@ binder_call(platform_app, xkernel_vm_service)
 allow xkernel_vm_service permission_service:service_manager find;
 binder_call(xkernel_vm_service, system_server)
 
+# The read-only monitoring interface (src/monitor.rs): the hypervisor's EL2 cycles per CPU and the
+# VM's CPU time, for monitor apps. Any app may look it up (app_api_service) and call it; the service
+# answers only callers holding READ_VM_STATS or CONTROL_VM (signature|privileged|development),
+# because platform policy keeps system-wide CPU accounting such as /proc/stat from ordinary apps.
+type xkernel_vm_monitor_service, app_api_service, service_manager_type;
+add_service(xkernel_vm_service, xkernel_vm_monitor_service)
+binder_call({ untrusted_app_all priv_app system_app }, xkernel_vm_service)
+
+# The host driver's EL2 cycle counters (genfs_contexts): this service starts, reads and stops
+# them. Their own label keeps the service from writing other proc files, and apps from writing
+# this one (an app that wrote 1 on every refresh raced the counters' power-transition brackets).
+type proc_xcore_stats, fs_type, proc_type;
+allow xkernel_vm_service proc_xcore_stats:file rw_file_perms;
+# The driver creates it 0644 root root; the loader makes it 0660 root system (loader/main.rs).
+allow xkernel_vm_loader proc_xcore_stats:file { getattr setattr };
+
 # A client of AVF: spawns its own virtmgr and passes it the VM images.
 virtualizationservice_use(xkernel_vm_service)
 get_prop(xkernel_vm_service, hypervisor_prop)
@@ -24,7 +40,8 @@ type xkernel_vm_data_file, file_type, data_file_type, core_data_file_type;
 allow xkernel_vm_service xkernel_vm_data_file:dir create_dir_perms;
 allow xkernel_vm_service xkernel_vm_data_file:file create_file_perms;
 
-# The reclaim check reads /proc/<pid>/{cmdline,stat} of the VM's crosvm.
+# The reclaim check reads /proc/<pid>/{cmdline,stat} of the VM's crosvm; so does the monitoring
+# interface for the VM's CPU time.
 r_dir_file(xkernel_vm_service, crosvm)
 r_dir_file(xkernel_vm_service, virtualizationmanager)
 # To find a crosvm_<name> process it scans every /proc entry. A crosvm only ever runs in the crosvm

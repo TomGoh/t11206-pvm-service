@@ -10,13 +10,19 @@
 //! domain open it), and writes `loaded <request>` or `failed <request>: <reason>` to
 //! `xkernel_vm.driver_status`, `<request>` being the newest value of the request property.
 //!
+//! Before reporting, it also makes the driver's EL2 cycle counter file, `/proc/xcore_stats`,
+//! 0660 root system, so that the control service (uid system, no capabilities) can start, read
+//! and stop the counters for the monitoring interface. The driver creates it 0644 root root. The
+//! monitor is optional: a driver without it, or a failure here, is logged and the load still
+//! succeeds.
+//!
 //! Usage: `xkernel_vm_loader [DIR [DEVICE]]`, by default `/system_ext/etc/xkernel_vm/modules`
 //! and `/dev/xhyper`.
 
 mod loader;
 
 use loader::{clip, load_all, parse_list, Kernel, LOAD_PROPERTY, STATUS_PROPERTY};
-use log::{error, info, LevelFilter};
+use log::{error, info, warn, LevelFilter};
 use rustutils::system_properties;
 use std::ffi::CString;
 use std::fs::File;
@@ -29,6 +35,9 @@ use std::time::Duration;
 
 const DEFAULT_DIR: &str = "/system_ext/etc/xkernel_vm/modules";
 const DEFAULT_DEVICE: &str = "/dev/xhyper";
+/// The driver's EL2 cycle counters, written and read by the control service.
+const MONITOR_FILE: &str = "/proc/xcore_stats";
+const AID_SYSTEM: libc::gid_t = 1000;
 const NODE_TIMEOUT: Duration = Duration::from_secs(5);
 /// A system property value holds at most 91 bytes.
 const PROPERTY_VALUE_MAX: usize = 91;
@@ -88,10 +97,34 @@ impl Kernel for System {
     }
 }
 
+/// Makes [`MONITOR_FILE`] 0660 root system; returns whether the driver offers it.
+fn prepare_monitor() -> io::Result<bool> {
+    let path = c_path(Path::new(MONITOR_FILE))?;
+    // SAFETY: access only reads the NUL-terminated path.
+    if unsafe { libc::access(path.as_ptr(), libc::F_OK) } != 0 {
+        return Ok(false);
+    }
+    // SAFETY: chown only reads the NUL-terminated path.
+    if unsafe { libc::chown(path.as_ptr(), 0, AID_SYSTEM) } != 0 {
+        return Err(io::Error::last_os_error());
+    }
+    // SAFETY: chmod only reads the NUL-terminated path.
+    if unsafe { libc::chmod(path.as_ptr(), 0o660) } != 0 {
+        return Err(io::Error::last_os_error());
+    }
+    Ok(true)
+}
+
 fn run(dir: &Path, device: PathBuf) -> Result<Vec<String>, String> {
     let list = dir.join("modules.load");
     let text = std::fs::read_to_string(&list).map_err(|e| format!("{}: {e}", list.display()))?;
-    load_all(dir, &parse_list(&text)?, &System { device }, NODE_TIMEOUT)
+    let loaded = load_all(dir, &parse_list(&text)?, &System { device }, NODE_TIMEOUT)?;
+    match prepare_monitor() {
+        Ok(true) => info!("{MONITOR_FILE} made 0660 root system"),
+        Ok(false) => info!("the driver offers no {MONITOR_FILE}"),
+        Err(e) => warn!("can't give {MONITOR_FILE} to the control service: {e}"),
+    }
+    Ok(loaded)
 }
 
 fn main() -> ExitCode {
