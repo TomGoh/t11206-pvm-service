@@ -54,18 +54,18 @@ dontaudit xkernel_vm_service domain:file { read open getattr };
 allow { crosvm virtualizationmanager } xkernel_vm_service:fd use;
 allow { crosvm virtualizationmanager } xkernel_vm_service:fifo_file { getattr ioctl read write };
 
-# The direct backend: the service runs the product's crosvm build with the hypervisor's backend
-# (/system_ext/bin/xkernel_crosvm) itself. Platform policy lets only the crosvm domain open
-# kvm_device (/dev/vhost-vsock) and lets only virtmgr execute AVF's crosvm_exec, so crosvm runs
-# in AVF's crosvm domain, entered through xkernel_crosvm_launcher. The kernel clears the
-# parent-death signal on that domain change; the launcher arms it again and then executes the
-# crosvm build in the same domain, which keeps it (launcher/main.rs). Both crosvm processes, the
-# VM's and `crosvm stop <socket>`, start this way.
+# The direct backend: the service runs the platform's crosvm (/apex/com.android.virt/bin/crosvm,
+# crosvm_exec, built with its xhyper feature) itself. Platform policy lets only the crosvm domain
+# open kvm_device (/dev/vhost-vsock), and only crosvm, virtmgr and a few others execute
+# crosvm_exec (crosvm.te neverallow), so crosvm runs in AVF's crosvm domain, entered through
+# xkernel_crosvm_launcher. The kernel clears the parent-death signal on that domain change; the
+# launcher arms it again and then executes crosvm in the same domain, which keeps it
+# (launcher/main.rs). Both crosvm processes, the VM's and `crosvm stop <socket>`, start this way.
 type xkernel_crosvm_exec, system_file_type, exec_type, file_type;
 domain_auto_trans(xkernel_vm_service, xkernel_crosvm_exec, crosvm)
-type xkernel_crosvm_file, system_file_type, file_type;
-allow crosvm xkernel_crosvm_file:file { rx_file_perms execute_no_trans };
-allow xkernel_vm_service xkernel_crosvm_file:file getattr;
+allow crosvm crosvm_exec:file { rx_file_perms execute_no_trans };
+# The start check reads its type and mode (no execute permission: that stays with crosvm).
+allow xkernel_vm_service crosvm_exec:file getattr;
 # Killing a crosvm that ignores the stop request; also the parent-death signal.
 allow xkernel_vm_service crosvm:process { sigkill signal };
 

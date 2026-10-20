@@ -4,8 +4,9 @@
 #   $(call inherit-product, <path of this directory>/product.mk)
 #
 # This directory is self-contained: the built service programs and control app, the init script,
-# the instance config, the SELinux policy sources, crosvm with the hypervisor's backend, the host
-# driver's modules and the x-kernel guest images. MANIFEST.txt says where each file comes from.
+# the instance config, the SELinux policy sources, the host driver's modules and the x-kernel
+# guest images. MANIFEST.txt says where each file comes from. crosvm is the platform's own
+# (com.android.virt built with external/crosvm's xhyper feature), not part of this directory.
 # The source repositories must not be in the same tree (duplicate modules). The monitor app is
 # imported like the product's other Kylin apps (product/monitor of t11206-pvm-service).
 XKERNEL_VM_DROP_DIR := $(patsubst %/,%,$(dir $(lastword $(MAKEFILE_LIST))))
@@ -13,8 +14,7 @@ XKERNEL_VM_DROP_DIR := $(patsubst %/,%,$(dir $(lastword $(MAKEFILE_LIST))))
 PRODUCT_PACKAGES += \
     xkernel_vm_service \
     xkernel_vm.json \
-    XKernelVmControl \
-    xkernel_crosvm
+    XKernelVmControl
 
 # The shell client, for debugging builds only.
 PRODUCT_PACKAGES_DEBUG += xkernel_vmctl

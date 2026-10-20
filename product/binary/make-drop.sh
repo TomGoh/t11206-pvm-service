@@ -3,7 +3,7 @@
 # image build includes with a single inherit-product line (product.mk.template). It holds the
 # programs and the control app built from source in an Android tree of the product's baseline,
 # this repository's init script, instance config and SELinux policy sources, and the prebuilts
-# that never come from source (crosvm with the hypervisor's backend, the host driver's modules,
+# that never come from source (the host driver's modules,
 # the x-kernel guest images). MANIFEST.txt records the origin and sha256 of every file.
 #
 #   make-drop.sh --product-out DIR --prebuilts DIR --out DIR [--app-commit SHA] [--service-commit SHA]
@@ -12,7 +12,7 @@
 #   --product-out  the build's PRODUCT_OUT after `m xkernel_vm_service xkernel_vmctl XKernelVmControl`
 #                  (for T11206 out_system/target/product/ussi_arm64): system_ext/bin/xkernel_* and
 #                  system_ext/app/XKernelVmControl/XKernelVmControl.apk are taken from there
-#   --prebuilts    xkernel_crosvm, modules/<each .ko of etc/modules.load>, kernel.bin, dummy.img,
+#   --prebuilts    modules/<each .ko of etc/modules.load>, kernel.bin, dummy.img,
 #                  rootfs.img (the template, with xkload already added by guest/add-to-rootfs.sh)
 #   --out          the delivery directory to create (must not exist, or be empty)
 #   --app-commit   the t11206-pvm-app commit the control app was built from (recorded only)
@@ -67,7 +67,6 @@ programs=(xkernel_vm_service xkernel_crosvm_launcher xkernel_vm_loader xkernel_v
 for p in "${programs[@]}"; do need "$product_out/system_ext/bin/$p"; done
 app=$product_out/system_ext/app/XKernelVmControl/XKernelVmControl.apk
 need "$app"
-need "$prebuilts/xkernel_crosvm"
 for m in "${modules[@]}"; do need "$prebuilts/modules/$m"; done
 for f in kernel.bin dummy.img rootfs.img; do need "$prebuilts/$f"; done
 extra=$(cd "$prebuilts/modules" && ls | grep -vxF -f <(printf '%s\n' "${modules[@]}") || true)
@@ -92,8 +91,7 @@ fi
 
 mkdir -p "$out"/{bin,app,etc/init,modules,sepolicy}
 for p in "${programs[@]}"; do cp "$product_out/system_ext/bin/$p" "$out/bin/$p"; done
-cp "$prebuilts/xkernel_crosvm" "$out/bin/xkernel_crosvm"
-for p in "${programs[@]}" xkernel_crosvm; do is_aarch64_elf "$out/bin/$p" || fail "bin/$p is not an AArch64 ELF file"; done
+for p in "${programs[@]}"; do is_aarch64_elf "$out/bin/$p" || fail "bin/$p is not an AArch64 ELF file"; done
 cp "$app" "$out/app/XKernelVmControl.apk"
 cp "$repo/etc/init/xkernel_vm_service.rc" "$out/etc/init/"
 cp "$repo/etc/xkernel_vm.json" "$repo/etc/modules.load" "$out/etc/"
@@ -136,7 +134,6 @@ for p in "${programs[@]}"; do
     have=$(declared "$p")
     [ "$want" = "$have" ] || fail "bin/$p needs [$(echo $want)] but Android.bp declares [$(echo $have)]"
 done
-[ -z "$(needed "$out/bin/xkernel_crosvm")" ] || fail "bin/xkernel_crosvm is not statically linked"
 
 {
     echo "x-kernel VM package, binary delivery"
@@ -149,7 +146,6 @@ done
     echo
     echo "Shared libraries of the programs (DT_NEEDED):"
     for p in "${programs[@]}"; do echo "  $p: $(needed "$out/bin/$p" | tr '\n' ' ')"; done
-    echo "  xkernel_crosvm: (statically linked)"
     echo "  ($PLATFORM_ONLY_LIBS: provided by the platform image, /system/lib64; not declared, see Android.bp)"
     echo
     echo "sha256 of every file:"

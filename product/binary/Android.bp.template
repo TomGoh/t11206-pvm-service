@@ -74,19 +74,6 @@ cc_prebuilt_binary {
     system_ext_specific: true,
 }
 
-// crosvm with the hypervisor's backend: /system_ext/bin/xkernel_crosvm, the path
-// etc/xkernel_vm.json names and the service's file_contexts labels. Statically linked.
-cc_prebuilt_binary {
-    name: "xkernel_crosvm",
-    srcs: ["bin/xkernel_crosvm"],
-    compile_multilib: "64",
-    strip: {
-        none: true,
-    },
-    check_elf_files: false,
-    system_ext_specific: true,
-}
-
 prebuilt_etc {
     name: "xkernel_vm.json",
     src: "etc/xkernel_vm.json",

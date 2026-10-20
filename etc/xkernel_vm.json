@@ -20,7 +20,8 @@
   "reclaim_window_seconds": 10,
   "backend": "direct",
   "direct": {
-    "crosvm": "/system_ext/bin/xkernel_crosvm",
+    "crosvm": "/apex/com.android.virt/bin/crosvm",
+    "hypervisor": "xhyper",
     "launcher": "/system_ext/bin/xkernel_crosvm_launcher",
     "cid": 1024
   },

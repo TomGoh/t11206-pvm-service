@@ -49,7 +49,6 @@ fn the_product_installs_what_the_config_names() {
     let config: serde_json::Value =
         serde_json::from_str(&repo_file("etc/xkernel_vm.json")).unwrap();
     let mk = repo_file("product.mk");
-    let template = repo_file("product/prebuilts.bp.template");
     let etc = "/system_ext/etc/xkernel_vm/";
     // product.mk copies these names from the prebuilts directory to /system_ext/etc/xkernel_vm.
     assert!(
@@ -60,13 +59,20 @@ fn the_product_installs_what_the_config_names() {
     let disks = config["disks"].as_array().unwrap();
     assert_eq!(disks[0]["path"], format!("{etc}dummy.img"));
     assert_eq!(disks[1]["template"], format!("{etc}rootfs.img"));
-    // The template's cc_prebuilt_binary installs /system_ext/bin/<name>.
-    assert_eq!(config["direct"]["crosvm"], "/system_ext/bin/xkernel_crosvm");
-    assert!(template.contains("name: \"xkernel_crosvm\""), "crosvm in the template");
-    assert!(mk.contains("PRODUCT_PACKAGES += xkernel_crosvm\n"), "crosvm in PRODUCT_PACKAGES");
-    assert!(!mk.contains("Monitor") && !template.contains("android_app"), "no monitor app here");
+    // crosvm is the platform's (com.android.virt, built with its xhyper feature), told to use
+    // XHyper; the product ships no crosvm of its own, and the policy lets the crosvm domain, which
+    // the launcher enters, execute crosvm_exec.
+    assert_eq!(config["direct"]["crosvm"], "/apex/com.android.virt/bin/crosvm");
+    assert_eq!(config["direct"]["hypervisor"], "xhyper");
+    assert!(
+        !mk.contains("xkernel_crosvm\n") && !mk.contains("xkernel_crosvm \\"),
+        "no crosvm prebuilt"
+    );
+    assert!(!mk.contains("Monitor"), "no monitor app here");
     let contexts = repo_file("sepolicy/private/file_contexts");
-    assert!(contexts.contains("/system_ext/bin/xkernel_crosvm "), "crosvm label");
+    assert!(!contexts.contains("/system_ext/bin/xkernel_crosvm "), "no crosvm prebuilt label");
+    let te = repo_file("sepolicy/private/xkernel_vm_service.te");
+    assert!(te.contains("allow crosvm crosvm_exec:file { rx_file_perms execute_no_trans };"));
 }
 
 /// The modules of an Android.bp: (type, name, body), for blocks that start in column 0.
@@ -131,8 +137,8 @@ fn the_binary_delivery_matches_the_source_build() {
     let binary = bp_modules(&repo_file("product/binary/Android.bp.template"));
     let source_mk = repo_file("product.mk");
     // What the source build installs: product.mk's packages and, transitively, what this
-    // repository's modules among them require. The control app (t11206-pvm-app) and crosvm (the
-    // prebuilts template) are listed there too.
+    // repository's modules among them require. The control app (t11206-pvm-app) is listed there
+    // too.
     let mut want: Vec<String> = mk_packages(&source_mk, "PRODUCT_PACKAGES");
     want.extend(mk_packages(&source_mk, "PRODUCT_PACKAGES_DEBUG"));
     let mut next = 0;

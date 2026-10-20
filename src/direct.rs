@@ -156,6 +156,10 @@ pub fn crosvm_args(config: &VmConfig, direct: &DirectConfig, socket: &Path) -> V
     push(&direct.log_level);
     push("--no-syslog");
     push("run");
+    if let Some(hypervisor) = &direct.hypervisor {
+        push("--hypervisor");
+        push(hypervisor);
+    }
     push("--disable-sandbox");
     if let Some(cid) = direct.cid {
         push("--cid");
@@ -506,6 +510,20 @@ mod tests {
             "--no-usb", "--socket", "/s/crosvm.sock",
         ];
         assert_eq!(args, want);
+    }
+
+    #[test]
+    fn the_hypervisor_is_named_when_configured() {
+        let mut c = tablet_config(Path::new("/s"));
+        c.direct.as_mut().unwrap().hypervisor = Some("xhyper".into());
+        let args = crosvm_args(&c, c.direct.as_ref().unwrap(), Path::new("/s/crosvm.sock"));
+        let run = args.iter().position(|a| a == "run").unwrap();
+        assert_eq!(args[run + 1..run + 3], ["--hypervisor", "xhyper"]);
+        // Without it, the command line is the one above: crosvm picks the backend itself.
+        let mut c = tablet_config(Path::new("/s"));
+        c.direct.as_mut().unwrap().hypervisor = None;
+        let args = crosvm_args(&c, c.direct.as_ref().unwrap(), Path::new("/s/crosvm.sock"));
+        assert!(!args.iter().any(|a| a == "--hypervisor"));
     }
 
     #[test]

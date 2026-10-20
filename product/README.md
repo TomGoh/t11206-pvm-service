@@ -37,16 +37,14 @@
 | 控制应用“X 内核虚拟机” | 仓库 `t11206-pvm-app` | `/system_ext/app/XKernelVmControl` | 源码编译（平台密钥签名），`product.mk` |
 | 宿主驱动模块（7 个 `.ko`，顺序见 `etc/modules.load`） | 宿主驱动的构建，必须与平板内核一起编译 | `/system_ext/etc/xkernel_vm/modules/` | 预编译目录 `modules/`，`product.mk` 复制 |
 | 客户机内核 `kernel.bin`、只读盘 `dummy.img`、根文件系统模板 `rootfs.img` | x-kernel 的交付 | `/system_ext/etc/xkernel_vm/` | 预编译目录，`product.mk` 复制 |
-| 带虚拟化层后端的 crosvm（静态链接） | crosvm 的交付 | `/system_ext/bin/xkernel_crosvm` | 预编译目录，模板里的 `cc_prebuilt_binary` |
+| crosvm | 平台自己的 crosvm（com.android.virt），由开启 `xhyper` 功能的 external/crosvm 编出（kylin100-pad-dev，Gerrit 324346–324349） | `/apex/com.android.virt/bin/crosvm` | 随系统镜像的 com.android.virt，本包不带 |
 
 步骤：
 
 1. 把 `t11206-pvm-service` 和 `t11206-pvm-app` 两个仓库放进与设备版本一致的 Android 源码树（目录位置不限）。
-2. 建一个预编译目录（必须在源码树里，因为里面要放 Android.bp），放入：
+2. 在源码树里建一个预编译目录，放入：
    - `modules/` 下的 7 个 `.ko`；
    - `kernel.bin`、`dummy.img`、`rootfs.img`；放入 `rootfs.img` 前先运行 `guest/add-to-rootfs.sh rootfs.img`，把负载模拟工具 `xkload` 放进模板（见 `guest/README.md`）；
-   - `xkernel_crosvm`；
-   - 把本目录的 `prebuilts.bp.template` 复制成 `Android.bp`。
 3. 在产品的 makefile 里设置预编译目录并包含本仓库的 `product.mk`：
 
    ```make
@@ -54,7 +52,7 @@
    $(call inherit-product, <本仓库路径>/product.mk)                    # 或 include
    ```
 
-   `product.mk` 会加入这些模块：`xkernel_vm_service`、`xkernel_vm.json`、`XKernelVmControl`、`xkernel_crosvm`，以及只在调试版本中安装的 `xkernel_vmctl`。它还会加入 system_ext 私有策略目录，并复制模块和客户机镜像。
+   `product.mk` 会加入这些模块：`xkernel_vm_service`、`xkernel_vm.json`、`XKernelVmControl`，以及只在调试版本中安装的 `xkernel_vmctl`。它还会加入 system_ext 私有策略目录，并复制模块和客户机镜像。
 
 ## 四、二进制交付
 
@@ -67,7 +65,7 @@
    ```
 
    T11206 的系统一半用 `ussi_arm64_full`，产物在 `out_system/target/product/ussi_arm64`。
-2. 准备和源码交付第 2 步相同的预编译文件：`xkernel_crosvm`、`modules/` 下的 7 个 `.ko`、`kernel.bin`、`dummy.img`、`rootfs.img`（已放入 `xkload`）。这里不需要 `Android.bp`。
+2. 准备和源码交付第 2 步相同的预编译文件：`modules/` 下的 7 个 `.ko`、`kernel.bin`、`dummy.img`、`rootfs.img`（已放入 `xkload`）。这里不需要 `Android.bp`。
 3. 运行本目录的 `binary/make-drop.sh`：
 
    ```sh
@@ -92,7 +90,7 @@
 
 | 路径 | 内容 | 装到哪里 |
 |---|---|---|
-| `bin/` | `xkernel_vm_service`、`xkernel_crosvm_launcher`、`xkernel_vm_loader`、`xkernel_vmctl`（只进调试版本）、`xkernel_crosvm` | `/system_ext/bin` |
+| `bin/` | `xkernel_vm_service`、`xkernel_crosvm_launcher`、`xkernel_vm_loader`、`xkernel_vmctl`（只进调试版本） | `/system_ext/bin` |
 | `app/XKernelVmControl.apk` | 控制应用 | `/system_ext/app/XKernelVmControl` |
 | `etc/` | init 脚本、实例配置 `xkernel_vm.json`、`modules.load` | `/system_ext/etc/init`、`/system_ext/etc/xkernel_vm` |
 | `modules/` | 宿主驱动的 7 个模块 | `/system_ext/etc/xkernel_vm/modules` |

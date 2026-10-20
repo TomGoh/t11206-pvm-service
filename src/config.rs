@@ -41,7 +41,7 @@
 //!
 //! ```json
 //! "backend": "direct",
-//! "direct": { "crosvm": "/system_ext/bin/xkernel_crosvm", "cid": 1024 }
+//! "direct": { "crosvm": "/apex/com.android.virt/bin/crosvm", "hypervisor": "xhyper", "cid": 1024 }
 //! ```
 //!
 //! It does not use AVF's admission, so it checks neither virtmgr nor the AVF property; whether a
@@ -113,8 +113,14 @@ pub enum BackendKind {
 #[derive(Clone, Debug, Deserialize, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
 pub struct DirectConfig {
-    /// The crosvm binary to run: a build with the hypervisor's backend.
+    /// The crosvm binary to run: a build with the hypervisor's backend. On T11206 that is the
+    /// platform's own crosvm (`/apex/com.android.virt/bin/crosvm`), built with its `xhyper`
+    /// feature.
     pub crosvm: PathBuf,
+    /// crosvm's `--hypervisor`, the backend to run the VM on (`xhyper`). Without it crosvm picks
+    /// one itself: KVM when /dev/kvm exists, otherwise XHyper when /dev/xhyper exists.
+    #[serde(default)]
+    pub hypervisor: Option<String>,
     /// `xkernel_crosvm_launcher`, which starts crosvm so that it dies with this service even
     /// though it runs in another SELinux domain (see `launcher/main.rs`). Without one crosvm is
     /// started directly; then only a start without a domain change keeps that guarantee.
