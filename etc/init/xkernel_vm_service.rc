@@ -5,7 +5,11 @@ service xkernel_vm_service /system_ext/bin/xkernel_vm_service
     # crosvm runs with this service's identity and opens /dev/xhyper, which xkernel_vm_loader
     # makes 0666 like /dev/kvm; SELinux lets only the crosvm domain open it. No capabilities.
     user system
-    group system virtualmachine
+    # readproc: /proc is mounted hidepid=invisible, and the platform crosvm (com.android.virt) carries the
+    # file capability SYS_RESOURCE, so without this group the service cannot see the VM's crosvm in /proc:
+    # the reclaim check would confirm a crosvm it cannot see as gone and the monitoring interface would
+    # report no VM CPU time.
+    group system virtualmachine readproc
     # The hypervisor driver pins the guest's memory against the locked-memory limit (8 MiB by
     # default; a 256 MiB guest then fails at its first run). crosvm inherits this one.
     rlimit memlock unlimited unlimited
