@@ -31,10 +31,10 @@ use binder::{
 };
 use com_kylinos_xkernelvm::aidl::com::kylinos::xkernelvm::{
     ConsoleOutput::ConsoleOutput,
-    IXKernelVmCallback::IXKernelVmCallback,
-    IXKernelVmConsoleCallback::IXKernelVmConsoleCallback,
     El2Counters::El2Counters,
     El2CycleSample::El2CycleSample,
+    IXKernelVmCallback::IXKernelVmCallback,
+    IXKernelVmConsoleCallback::IXKernelVmConsoleCallback,
     IXKernelVmControl::{
         IXKernelVmControl, ERROR_BUSY, ERROR_NOT_RUNNING, ERROR_RECLAIM_PENDING, ERROR_UNAVAILABLE,
     },

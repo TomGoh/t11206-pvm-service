@@ -23,9 +23,10 @@ interface IXKernelVmMonitor {
     const int EL2_UNAVAILABLE = 1;
 
     /**
-     * The EL2 cycle counters. The first call starts them (and loads the hypervisor driver if
-     * needed); they stop again once no client has asked for a while, so poll at least every few
-     * seconds while showing them.
+     * The EL2 cycle counters. Reads never load or prepare the driver. The first read starts
+     * counters only when the VM lifecycle allows it and the driver is already available;
+     * otherwise EL2_UNAVAILABLE explains why. Counters stop once no client has asked for a while,
+     * so poll at least every few seconds while showing them.
      */
     El2Counters getEl2Counters();
 

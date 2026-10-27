@@ -13,12 +13,18 @@
 //!
 //! The executor holds the instance's AVF objects from a successful start until the reclaim check
 //! begins; the check drops them and then waits up to the reclaim window for the instance's
-//! processes to finish exiting.
+//! processes to finish exiting. Confirmed reclaim then queues driver cleanup on this executor;
+//! the machine stays stopping until its result. Startup does the same if restore finds no VM
+//! and the backend owns an on-demand driver. A restored leftover stays reclaim-unknown while
+//! one check chain on this serial executor watches it at reclaim-window cadence. Its disappearance
+//! confirms reclaim and queues driver cleanup without requiring another client stop request;
+//! a stop during that watch joins it. A leftover VM always blocks cleanup and new starts.
 //!
 //! Persisted record: right after a start the executor writes the instance's crosvm processes to
 //! `state_dir/instance.json` with the boot ID; a gone confirmation clears it. A restarted service
 //! reads it (and scans for `crosvm_<name>`) before accepting a start, so it never starts a second
-//! instance next to one an earlier run left behind.
+//! instance next to one an earlier run left behind. Startup and later reclaim scans add discovered
+//! PID/start-time identities to this record; an empty cmdline during blocked exit cannot erase them.
 
 use crate::machine::{Action, Event, Exit, Machine, Refused, Snapshot};
 use crate::reclaim::{self, TrackedProcess};
@@ -52,6 +58,14 @@ pub trait Instance: Send + Sync + 'static {
 
 /// Creates instances.
 pub trait Backend: Send + Sync + 'static {
+    /// Whether startup must clean a driver left with no instance.
+    fn has_driver(&self) -> bool {
+        false
+    }
+    /// Called only after reclaim is confirmed, on the serial executor.
+    fn unload_driver(&self) -> Result<(), String> {
+        Ok(())
+    }
     type Instance: Instance;
     /// Creates and starts the VM of `generation`. `on_death` must be called exactly once when AVF
     /// reports the VM dead or the virtualization manager serving it dies.
@@ -129,8 +143,15 @@ impl<B: Backend> Controller<B> {
             warn!("found a leftover instance: {detail}");
         }
         let (tx, rx) = channel::<Action>();
+        let has_leftover = restored.1.is_some();
+        let mut machine = Machine::new(settings.readiness.is_some(), restored.1);
+        let startup = if has_leftover || backend.has_driver() {
+            machine.cleanup_on_start()
+        } else {
+            Vec::new()
+        };
         let inner = Arc::new(Inner {
-            machine: Mutex::new(Machine::new(settings.readiness.is_some(), restored.1)),
+            machine: Mutex::new(machine),
             backend,
             settings,
             preflight,
@@ -140,6 +161,9 @@ impl<B: Backend> Controller<B> {
             instance: Mutex::new(None),
             tracked: Mutex::new(restored.0),
         });
+        if has_leftover {
+            inner.record(&inner.tracked.lock().unwrap());
+        }
         let weak = Arc::downgrade(&inner);
         thread::Builder::new()
             .name("xkvm-executor".into())
@@ -151,6 +175,7 @@ impl<B: Backend> Controller<B> {
             })
             .expect("can't spawn the executor");
         let controller = Self { inner };
+        controller.inner.queue(startup);
         controller.refresh();
         controller
     }
@@ -263,6 +288,13 @@ impl<B: Backend> Inner<B> {
             }
             Action::ProbeReady { generation } => self.probe_ready(generation),
             Action::CheckReclaim { generation } => self.check_reclaim(generation),
+            Action::UnloadDriver { generation } => {
+                let result = self.backend.unload_driver();
+                if let Err(reason) = &result {
+                    warn!("driver unload of generation {generation} failed: {reason}");
+                }
+                self.post(Event::DriverUnloaded { generation, result });
+            }
         }
     }
 
@@ -319,6 +351,9 @@ impl<B: Backend> Inner<B> {
     }
 
     fn check_reclaim(self: &Arc<Self>, generation: u64) {
+        if !self.machine.lock().unwrap().reclaim_check_pending(generation) {
+            return;
+        }
         // Release the AVF objects of this generation.
         {
             let mut slot = self.instance.lock().unwrap();
@@ -326,11 +361,20 @@ impl<B: Backend> Inner<B> {
                 *slot = None;
             }
         }
-        let tracked = self.tracked.lock().unwrap().clone();
-        let deadline = Instant::now() + self.settings.reclaim_window;
+        let mut tracked = self.tracked.lock().unwrap().clone();
+        // A zero-sized window must not turn the startup watch into a busy requeue loop.
+        let deadline = Instant::now() + self.settings.reclaim_window.max(RECLAIM_POLL);
         loop {
-            let left =
-                reclaim::leftovers(&self.settings.proc_root, &self.settings.process_name, &tracked);
+            let before = tracked.len();
+            let left = reclaim::leftovers(
+                &self.settings.proc_root,
+                &self.settings.process_name,
+                &mut tracked,
+            );
+            if tracked.len() != before {
+                *self.tracked.lock().unwrap() = tracked.clone();
+                self.record(&tracked);
+            }
             if left.is_empty() {
                 self.tracked.lock().unwrap().clear();
                 self.record(&[]);
@@ -374,7 +418,7 @@ fn restore(settings: &Settings) -> (Vec<TrackedProcess>, Option<String>) {
     let path = settings.state_dir.join(RECORD_FILE);
     let record: Option<InstanceRecord> =
         fs::read(&path).ok().and_then(|bytes| serde_json::from_slice(&bytes).ok());
-    let tracked = match record {
+    let mut tracked = match record {
         // PIDs of another boot mean nothing in this one.
         Some(record) if record.boot_id == settings.boot_id => record.processes,
         Some(_) => {
@@ -383,7 +427,7 @@ fn restore(settings: &Settings) -> (Vec<TrackedProcess>, Option<String>) {
         }
         None => Vec::new(),
     };
-    let left = reclaim::leftovers(&settings.proc_root, &settings.process_name, &tracked);
+    let left = reclaim::leftovers(&settings.proc_root, &settings.process_name, &mut tracked);
     if left.is_empty() {
         if !tracked.is_empty() {
             let _ = fs::remove_file(&path);
@@ -427,6 +471,10 @@ mod tests {
         starts: AtomicU32,
         next_pid: AtomicU32,
         death: DeathHook,
+        driver: bool,
+        unloads: AtomicU32,
+        unload_delay_ms: AtomicU32,
+        unload_error: Mutex<Option<String>>,
     }
 
     struct FakeInstance {
@@ -470,6 +518,18 @@ mod tests {
 
     impl Backend for FakeBackend {
         type Instance = FakeInstance;
+        fn has_driver(&self) -> bool {
+            self.driver
+        }
+        fn unload_driver(&self) -> Result<(), String> {
+            // Cleanup must only happen after reclaim dropped the instance and its process.
+            assert!(reclaim::find_by_arg0(&self.proc_root, "crosvm_xkernel_vm").is_empty());
+            self.unloads.fetch_add(1, Ordering::SeqCst);
+            thread::sleep(
+                Duration::from_millis(self.unload_delay_ms.load(Ordering::SeqCst) as u64),
+            );
+            self.unload_error.lock().unwrap().clone().map_or(Ok(()), Err)
+        }
         fn create_and_start(
             &self,
             _generation: u64,
@@ -502,6 +562,15 @@ mod tests {
 
     impl Harness {
         fn new(tag: &str, readiness: Option<(Probe, Duration)>, setup: impl FnOnce(&Path)) -> Self {
+            Self::with_driver(tag, readiness, setup, false)
+        }
+
+        fn with_driver(
+            tag: &str,
+            readiness: Option<(Probe, Duration)>,
+            setup: impl FnOnce(&Path),
+            driver: bool,
+        ) -> Self {
             let root = std::env::temp_dir().join(format!("xkvm-ctl-{tag}-{}", std::process::id()));
             let _ = fs::remove_dir_all(&root);
             fs::create_dir_all(root.join("proc")).unwrap();
@@ -515,6 +584,10 @@ mod tests {
                 starts: AtomicU32::new(0),
                 next_pid: AtomicU32::new(1000),
                 death: Arc::new(Mutex::new(None)),
+                driver,
+                unloads: AtomicU32::new(0),
+                unload_delay_ms: AtomicU32::new(if driver { 200 } else { 0 }),
+                unload_error: Mutex::new(None),
             };
             let settings = Settings {
                 process_name: "crosvm_xkernel_vm".into(),
@@ -649,6 +722,150 @@ mod tests {
         assert!(h.controller.request_start().is_err());
     }
 
+    fn restored_process(root: &Path, recorded: bool) {
+        write_process(&root.join("proc"), 4242, "crosvm_xkernel_vm", 'D');
+        if recorded {
+            let record = InstanceRecord {
+                boot_id: "boot-1".into(),
+                processes: vec![TrackedProcess { pid: 4242, start_time: 4242000 }],
+            };
+            fs::create_dir_all(root.join("state")).unwrap();
+            fs::write(record_path(&root.join("state")), serde_json::to_vec(&record).unwrap())
+                .unwrap();
+        }
+    }
+
+    #[test]
+    fn restored_recorded_process_disappears_and_unloads_once_without_a_stop() {
+        let h = Harness::with_driver(
+            "restore-auto-gone",
+            None,
+            |root| {
+                restored_process(root, true);
+            },
+            true,
+        );
+        assert_eq!(h.controller.status().state, VmState::ReclaimUnknown);
+        assert_eq!(h.backend().unloads.load(Ordering::SeqCst), 0);
+        fs::remove_dir_all(h.root.join("proc/4242")).unwrap();
+        let s = h.wait_for(VmState::Stopped);
+        assert!(s.reclaim_confirmed);
+        assert!(h.controller.processes().is_empty());
+        assert!(!record_path(&h.root.join("state")).exists());
+        assert_eq!(h.backend().unloads.load(Ordering::SeqCst), 1);
+        assert_eq!(
+            h.seen.0.lock().unwrap().iter().filter(|s| s.state == VmState::Stopped).count(),
+            1
+        );
+        h.controller.request_start().unwrap();
+        h.wait_for(VmState::RunningNotReady);
+    }
+
+    #[test]
+    fn restored_scanned_process_stays_pending_across_windows_without_unloading() {
+        let h = Harness::with_driver(
+            "restore-auto-stays",
+            None,
+            |root| {
+                restored_process(root, false);
+            },
+            true,
+        );
+        // Observe more than two configured windows, so one failed check is not sufficient.
+        thread::sleep(h.controller.inner.settings.reclaim_window * 2 + RECLAIM_POLL);
+        assert_eq!(h.controller.status().state, VmState::ReclaimUnknown);
+        assert!(matches!(h.controller.request_start(), Err(Refused::ReclaimPending(_))));
+        assert_eq!(h.backend().starts.load(Ordering::SeqCst), 0);
+        assert_eq!(h.backend().unloads.load(Ordering::SeqCst), 0);
+        fs::remove_dir_all(h.root.join("proc/4242")).unwrap();
+        h.wait_for(VmState::Stopped);
+        assert_eq!(h.backend().unloads.load(Ordering::SeqCst), 1);
+    }
+
+    #[test]
+    fn stop_during_restored_watch_joins_the_checker_and_unloads_once() {
+        let h = Harness::with_driver(
+            "restore-auto-stop",
+            None,
+            |root| {
+                restored_process(root, true);
+            },
+            true,
+        );
+        for _ in 0..8 {
+            h.controller.request_stop();
+        }
+        assert_eq!(h.controller.status().state, VmState::ReclaimUnknown);
+        assert_eq!(h.backend().unloads.load(Ordering::SeqCst), 0);
+        fs::remove_dir_all(h.root.join("proc/4242")).unwrap();
+        h.wait_for(VmState::Stopped);
+        assert_eq!(h.backend().unloads.load(Ordering::SeqCst), 1);
+        assert_eq!(
+            h.seen.0.lock().unwrap().iter().filter(|s| s.state == VmState::Stopping).count(),
+            1
+        );
+        assert_eq!(
+            h.seen.0.lock().unwrap().iter().filter(|s| s.state == VmState::Stopped).count(),
+            1
+        );
+    }
+
+    #[test]
+    fn startup_scan_remembers_identity_after_cmdline_is_cleared_in_blocked_exit() {
+        let h = Harness::with_driver(
+            "restore-scan-exit",
+            None,
+            |root| {
+                restored_process(root, false);
+            },
+            true,
+        );
+        let identity = TrackedProcess { pid: 4242, start_time: 4242000 };
+        assert_eq!(h.controller.processes(), [identity]);
+        let saved: InstanceRecord =
+            serde_json::from_slice(&fs::read(record_path(&h.root.join("state"))).unwrap()).unwrap();
+        assert_eq!(saved.processes, [identity]);
+        fs::write(h.root.join("proc/4242/cmdline"), b"").unwrap();
+        h.wait_for(VmState::ReclaimUnknown);
+        assert_eq!(h.controller.status().state, VmState::ReclaimUnknown);
+        assert!(matches!(h.controller.request_start(), Err(Refused::ReclaimPending(_))));
+        assert_eq!(h.backend().unloads.load(Ordering::SeqCst), 0);
+        fs::remove_dir_all(h.root.join("proc/4242")).unwrap();
+        h.wait_for(VmState::Stopped);
+        assert_eq!(h.backend().unloads.load(Ordering::SeqCst), 1);
+    }
+
+    #[test]
+    fn later_scans_remember_new_processes_until_their_exit_is_confirmed() {
+        let h = Harness::with_driver(
+            "restore-later-scan",
+            None,
+            |root| {
+                restored_process(root, false);
+            },
+            true,
+        );
+        write_process(&h.root.join("proc"), 4243, "crosvm_xkernel_vm", 'D');
+        h.wait_for(VmState::ReclaimUnknown);
+        let identity = TrackedProcess { pid: 4243, start_time: 4243000 };
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while !h.controller.processes().contains(&identity) {
+            assert!(Instant::now() < deadline, "later process was never tracked");
+            thread::sleep(Duration::from_millis(20));
+        }
+        let saved: InstanceRecord =
+            serde_json::from_slice(&fs::read(record_path(&h.root.join("state"))).unwrap()).unwrap();
+        assert!(saved.processes.contains(&TrackedProcess { pid: 4243, start_time: 4243000 }));
+        fs::write(h.root.join("proc/4243/cmdline"), b"").unwrap();
+        fs::remove_dir_all(h.root.join("proc/4242")).unwrap();
+        thread::sleep(h.controller.inner.settings.reclaim_window * 2 + RECLAIM_POLL);
+        assert_eq!(h.controller.status().state, VmState::ReclaimUnknown);
+        assert_eq!(h.backend().unloads.load(Ordering::SeqCst), 0);
+        fs::remove_dir_all(h.root.join("proc/4243")).unwrap();
+        h.wait_for(VmState::Stopped);
+        assert_eq!(h.backend().unloads.load(Ordering::SeqCst), 1);
+    }
+
     #[test]
     fn record_of_another_boot_is_discarded() {
         let h = Harness::new("oldboot", None, |root| {
@@ -662,5 +879,29 @@ mod tests {
         });
         assert_eq!(h.controller.status().state, VmState::Stopped);
         assert!(!record_path(&h.root.join("state")).exists());
+    }
+    #[test]
+    fn startup_and_stop_wait_for_driver_cleanup_and_failure_does_not_wedge() {
+        let h = Harness::with_driver("driver-cleanup", None, |_| {}, true);
+        assert!(matches!(h.controller.request_start(), Err(Refused::Busy(_))));
+        h.wait_for(VmState::Stopped);
+        assert_eq!(h.backend().unloads.load(Ordering::SeqCst), 1);
+        h.seen.0.lock().unwrap().clear();
+        h.controller.request_start().unwrap();
+        h.wait_for(VmState::RunningNotReady);
+        *h.backend().unload_error.lock().unwrap() = Some("simulated unload timeout".into());
+        h.controller.request_stop();
+        // Death alone cannot publish STOPPED while cleanup has not returned.
+        assert!(matches!(h.controller.request_start(), Err(Refused::Busy(_))));
+        let s = h.wait_for(VmState::Stopped);
+        assert!(s.reason.contains("simulated unload timeout"));
+        assert_eq!(h.backend().unloads.load(Ordering::SeqCst), 2);
+        h.seen.0.lock().unwrap().clear();
+        *h.backend().unload_error.lock().unwrap() = None;
+        h.controller.request_start().unwrap();
+        h.wait_for(VmState::RunningNotReady);
+        h.controller.request_stop();
+        h.wait_for(VmState::Stopped);
+        assert_eq!(h.backend().unloads.load(Ordering::SeqCst), 3);
     }
 }

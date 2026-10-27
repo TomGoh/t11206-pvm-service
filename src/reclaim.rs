@@ -16,6 +16,8 @@
 //!   its exit path: by then its memory is gone and `/proc/<pid>/cmdline` reads empty;
 //! - any process whose argv[0] is `crosvm_<name>`, the name AVF gives the VM's crosvm. This finds
 //!   a process the record missed, e.g. one started before this service restarted.
+//!   [`leftovers`] retains each discovered PID and start time in the caller's record,
+//!   so later checks still find it if its command line becomes empty during a blocked exit.
 //!
 //! Everything takes the `/proc` root as a parameter, so it is tested on fake trees.
 
@@ -78,22 +80,21 @@ pub fn find_by_arg0(proc_root: &Path, arg0: &str) -> Vec<TrackedProcess> {
     found
 }
 
-/// What is left of an instance: one line per process that has not finished exiting. Empty means
-/// the instance is gone.
-pub fn leftovers(proc_root: &Path, arg0: &str, tracked: &[TrackedProcess]) -> Vec<String> {
+/// Observes and remembers scanned identities before checking exit state. Keep `tracked` across
+/// checks (and persist it on changes). Returns one line per process that has not finished exiting;
+/// an empty result confirms that the entire instance is gone.
+pub fn leftovers(proc_root: &Path, arg0: &str, tracked: &mut Vec<TrackedProcess>) -> Vec<String> {
+    for process in find_by_arg0(proc_root, arg0) {
+        if !tracked.contains(&process) {
+            tracked.push(process);
+        }
+    }
     let mut left = Vec::new();
-    let mut seen = Vec::new();
     for process in tracked {
         if let Some((state, start_time)) = read_stat(proc_root, process.pid) {
             if start_time == process.start_time && !has_exited(state) {
                 left.push(format!("pid {} ({arg0}) is still in state {state}", process.pid));
-                seen.push(process.pid);
             }
-        }
-    }
-    for process in find_by_arg0(proc_root, arg0) {
-        if !seen.contains(&process.pid) {
-            left.push(format!("pid {} ({arg0}) is still running", process.pid));
         }
     }
     left
@@ -166,8 +167,8 @@ mod tests {
         let p = FakeProc::new("hung");
         // Memory gone, so cmdline is empty, but the process is still in uninterruptible sleep.
         p.add(200, &[], "crosvm", 'D', 700);
-        let tracked = [TrackedProcess { pid: 200, start_time: 700 }];
-        let left = leftovers(&p.0, NAME, &tracked);
+        let mut tracked = vec![TrackedProcess { pid: 200, start_time: 700 }];
+        let left = leftovers(&p.0, NAME, &mut tracked);
         assert_eq!(left.len(), 1);
         assert!(left[0].contains("pid 200") && left[0].contains("state D"), "{left:?}");
     }
@@ -177,12 +178,12 @@ mod tests {
         let p = FakeProc::new("reuse");
         p.add(300, &["sh"], "sh", 'S', 9999); // PID reused by another process
         p.add(301, &[], "crosvm", 'Z', 800); // finished exiting, not reaped yet
-        let tracked = [
+        let mut tracked = vec![
             TrackedProcess { pid: 300, start_time: 800 },
             TrackedProcess { pid: 301, start_time: 800 },
             TrackedProcess { pid: 302, start_time: 800 }, // gone entirely
         ];
-        assert!(leftovers(&p.0, NAME, &tracked).is_empty());
+        assert!(leftovers(&p.0, NAME, &mut tracked).is_empty());
     }
 
     #[test]
@@ -190,10 +191,26 @@ mod tests {
         let p = FakeProc::new("untracked");
         p.add(400, &[NAME, "run"], "crosvm", 'R', 900);
         p.add(401, &[NAME, "run"], "crosvm", 'S', 901);
-        let tracked = [TrackedProcess { pid: 400, start_time: 900 }];
-        let left = leftovers(&p.0, NAME, &tracked);
+        let mut tracked = vec![TrackedProcess { pid: 400, start_time: 900 }];
+        let left = leftovers(&p.0, NAME, &mut tracked);
         assert_eq!(left.len(), 2, "{left:?}");
         assert!(left.iter().any(|l| l.contains("pid 401")));
+    }
+
+    #[test]
+    fn scanned_identity_is_retained_when_cmdline_disappears_before_exit() {
+        let p = FakeProc::new("remember-scan");
+        p.add(500, &[NAME, "run"], "crosvm", 'S', 1000);
+        let mut tracked = Vec::new();
+        assert_eq!(leftovers(&p.0, NAME, &mut tracked).len(), 1);
+        assert_eq!(tracked, [TrackedProcess { pid: 500, start_time: 1000 }]);
+        p.add(500, &[], "crosvm", 'D', 1000);
+        let left = leftovers(&p.0, NAME, &mut tracked);
+        assert_eq!(left.len(), 1);
+        assert!(left[0].contains("state D"));
+        assert_eq!(tracked.len(), 1, "identity is not duplicated");
+        p.add(500, &[], "crosvm", 'Z', 1000);
+        assert!(leftovers(&p.0, NAME, &mut tracked).is_empty());
     }
 
     #[test]

@@ -5,7 +5,7 @@
 //!
 //! The machine is pure: it takes requests and events, changes its state, and returns the actions
 //! the executor must carry out (create and start the VM through AVF, stop it, probe its
-//! readiness, confirm that its resources are gone). Nothing here touches Binder, AVF or the file
+//! readiness, confirm that its resources are gone, unload the removable host driver). Nothing here touches Binder, AVF or the file
 //! system, so every rule is tested on the host.
 //!
 //! "AVF" below stands for the backend that runs the VM: AVF itself, or this service running
@@ -16,13 +16,13 @@
 //! | State | Meaning |
 //! |---|---|
 //! | `Unavailable` | No instance, and a precondition fails (driver, AVF, image, protection). |
-//! | `Stopped` | No instance, and the last one is confirmed gone. |
+//! | `Stopped` | No instance; reclaim and driver cleanup have completed (an unload error is recorded). |
 //! | `Starting` | The instance is being created and started through AVF. |
 //! | `RunningNotReady` | AVF runs the VM; the guest has not completed the readiness handshake. |
 //! | `Ready` | The guest completed the readiness handshake. |
-//! | `Stopping` | A stop or a confirmation that the instance is gone is in progress. |
+//! | `Stopping` | Death, reclaim or driver unload is in progress; starts remain busy throughout. |
 //! | `ReclaimUnknown` | The instance did not go away in time, or its process is still there. |
-//! | `Failed` | The instance failed or died unexpectedly; it is confirmed gone. |
+//! | `Failed` | The instance failed or died unexpectedly; reclaim and driver cleanup completed. |
 //!
 //! Rules:
 //!
@@ -34,8 +34,15 @@
 //! - A stop that does not see the VM die within the stop deadline moves to `ReclaimUnknown`; a
 //!   later death still confirms and moves on. Nothing restarts the VM on its own.
 //! - A stop while starting is remembered and carried out once the start has an outcome.
-//! - A stop in `ReclaimUnknown` re-runs the reclaim check. `Failed` is only entered once the
-//!   instance is confirmed gone, so a start may follow it directly and a stop has nothing to do.
+//! - A stop in `ReclaimUnknown` re-runs the reclaim check, or joins the existing startup watch.
+//!   `Failed` is a terminal off state entered only after reclaim and driver cleanup; a start may
+//!   follow it directly and a stop has nothing to do.
+//! - Reclaim confirmation queues driver cleanup; it never reports a final state before the unload
+//!   result or timeout. Cleanup failure still reaches `Stopped` with the reason, allowing a later
+//!   instance to retry cleanup. Successful cleanup retains `Failed` for a crash or failed start.
+//! - On service restart with no leftover instance, startup cleanup uses the same stopping phase.
+//!   Restored leftovers stay `ReclaimUnknown` while one serial, bounded check chain watches them.
+//!   Once they disappear, that chain confirms reclaim and enters the same driver cleanup phase.
 //! - Every instance has a generation; events of an older generation are ignored.
 //! - Every visible change bumps `seq`, so a client can drop stale snapshots.
 
@@ -96,6 +103,8 @@ pub enum Event {
     /// The reclaim check finished: `gone` says whether every process of the instance has exited;
     /// `detail` says what is left otherwise.
     ReclaimChecked { generation: u64, gone: bool, detail: String },
+    /// The driver cleanup finished, including a failed operation or timeout.
+    DriverUnloaded { generation: u64, result: Result<(), String> },
 }
 
 /// What the executor must do. Each action carries the generation it belongs to.
@@ -111,6 +120,8 @@ pub enum Action {
     ProbeReady { generation: u64 },
     /// Release the instance's AVF objects and check that its processes are gone.
     CheckReclaim { generation: u64 },
+    /// Stop owned counters and unload the removable host-driver modules.
+    UnloadDriver { generation: u64 },
 }
 
 /// Why a request is refused.
@@ -168,6 +179,10 @@ enum StopPhase {
     WaitingDeath,
     /// Waiting for the reclaim check.
     CheckingReclaim,
+    /// One automatic check chain owns a leftover restored at service startup.
+    WatchingReclaim,
+    /// Reclaim confirmed; waiting for driver cleanup.
+    UnloadingDriver,
 }
 
 /// The state machine. See the module header.
@@ -214,6 +229,29 @@ impl Machine {
             machine.reason = detail;
         }
         machine
+    }
+
+    /// Watch a restored instance, or clean up its driver if restore already confirmed it gone.
+    pub fn cleanup_on_start(&mut self) -> Vec<Action> {
+        if self.state == VmState::ReclaimUnknown && self.stop_phase == StopPhase::CheckingReclaim {
+            self.stop_phase = StopPhase::WatchingReclaim;
+            return vec![Action::CheckReclaim { generation: self.generation }];
+        }
+        if self.state != VmState::Stopped {
+            return Vec::new();
+        }
+        self.state = VmState::Stopping;
+        self.stop_phase = StopPhase::UnloadingDriver;
+        self.changed();
+        vec![Action::UnloadDriver { generation: self.generation }]
+    }
+
+    /// A queued check may touch this generation only while its reclaim phase still owns it.
+    pub fn reclaim_check_pending(&self, generation: u64) -> bool {
+        generation == self.generation
+            && ((self.state == VmState::Stopping && self.stop_phase == StopPhase::CheckingReclaim)
+                || (self.state == VmState::ReclaimUnknown
+                    && self.stop_phase == StopPhase::WatchingReclaim))
     }
 
     pub fn snapshot(&self) -> Snapshot {
@@ -323,6 +361,11 @@ impl Machine {
             }
             VmState::Stopping => (self.operation, Vec::new()),
             VmState::ReclaimUnknown => {
+                // Startup has no death callback. Its single automatic check chain already
+                // owns the wait; a stop must not queue another checker or change its phase.
+                if self.stop_phase == StopPhase::WatchingReclaim {
+                    return (self.operation, Vec::new());
+                }
                 let operation = self.next_operation();
                 // The outcome stays what it was when the confirmation was missed: "stopped" after
                 // a stop, the failure after an unexpected death.
@@ -408,7 +451,7 @@ impl Machine {
                     }
                     VmState::Stopping => self.stop_phase == StopPhase::WaitingDeath,
                     // A stop that timed out: the death resolves it; the outcome stays "stopped".
-                    VmState::ReclaimUnknown => true,
+                    VmState::ReclaimUnknown => self.stop_phase != StopPhase::WatchingReclaim,
                     // The VM died before AVF said it started.
                     VmState::Starting => {
                         self.stop_after_start = false;
@@ -440,27 +483,55 @@ impl Machine {
                 Vec::new()
             }
             Event::ReclaimChecked { generation, gone, detail } if generation == current => {
-                if !(self.state == VmState::Stopping
-                    && self.stop_phase == StopPhase::CheckingReclaim)
-                {
+                if !self.reclaim_check_pending(generation) {
                     return Vec::new();
                 }
                 if gone {
                     self.reclaim_confirmed = true;
-                    match std::mem::replace(&mut self.outcome, Outcome::Stopped) {
-                        Outcome::Stopped => {
-                            self.state = VmState::Stopped;
-                            self.reason.clear();
-                        }
-                        Outcome::Failed(reason) => {
-                            self.state = VmState::Failed;
-                            self.reason = reason;
-                        }
+                    self.state = VmState::Stopping;
+                    self.stop_phase = StopPhase::UnloadingDriver;
+                    self.changed();
+                    return vec![Action::UnloadDriver { generation }];
+                } else if self.stop_phase == StopPhase::WatchingReclaim {
+                    if self.reason != detail {
+                        self.reason = detail;
+                        self.changed();
                     }
+                    // The executor spent one bounded reclaim window on this check. Continue
+                    // at that cadence, keeping the visible state and refusing new starts.
+                    return vec![Action::CheckReclaim { generation }];
                 } else {
                     self.state = VmState::ReclaimUnknown;
                     self.reclaim_confirmed = false;
                     self.reason = detail;
+                }
+                self.changed();
+                Vec::new()
+            }
+            Event::DriverUnloaded { generation, result } if generation == current => {
+                if self.state != VmState::Stopping || self.stop_phase != StopPhase::UnloadingDriver
+                {
+                    return Vec::new();
+                }
+                let outcome = std::mem::replace(&mut self.outcome, Outcome::Stopped);
+                match (outcome, result) {
+                    (Outcome::Stopped, Ok(())) => {
+                        self.state = VmState::Stopped;
+                        self.reason.clear();
+                    }
+                    (Outcome::Failed(reason), Ok(())) => {
+                        self.state = VmState::Failed;
+                        self.reason = reason;
+                    }
+                    (outcome, Err(reason)) => {
+                        self.state = VmState::Stopped;
+                        self.reason = match outcome {
+                            Outcome::Failed(earlier) => {
+                                format!("{earlier}; driver unload failed: {reason}")
+                            }
+                            Outcome::Stopped => format!("driver unload failed: {reason}"),
+                        };
+                    }
                 }
                 self.changed();
                 Vec::new()
@@ -483,7 +554,13 @@ mod tests {
     }
 
     fn confirm_gone(m: &mut Machine, generation: u64) {
-        m.on_event(Event::ReclaimChecked { generation, gone: true, detail: String::new() });
+        assert_eq!(
+            m.on_event(Event::ReclaimChecked { generation, gone: true, detail: String::new() }),
+            vec![Action::UnloadDriver { generation }]
+        );
+        assert_eq!(m.snapshot().state, VmState::Stopping);
+        assert!(matches!(m.request_start(Ok(())), Err(Refused::Busy(_))));
+        m.on_event(Event::DriverUnloaded { generation, result: Ok(()) });
     }
 
     #[test]
@@ -769,5 +846,149 @@ mod tests {
         let before = m.snapshot();
         assert_eq!(m.request_stop(), (0, Vec::new()));
         assert_eq!(m.snapshot(), before);
+    }
+    #[test]
+    fn unload_failure_settles_stopped_with_reason_and_next_instance_retries() {
+        let mut m = Machine::new(false, None);
+        let g = started(&mut m);
+        m.request_stop();
+        m.on_event(Event::Died { generation: g, exit: Exit::Killed });
+        assert_eq!(
+            m.on_event(Event::ReclaimChecked { generation: g, gone: true, detail: String::new() }),
+            vec![Action::UnloadDriver { generation: g }]
+        );
+        assert!(matches!(m.request_start(Ok(())), Err(Refused::Busy(_))));
+        m.on_event(Event::StopTimedOut { generation: g });
+        assert_eq!(m.snapshot().state, VmState::Stopping);
+        m.on_event(Event::DriverUnloaded { generation: g, result: Err("deadline".into()) });
+        let s = m.snapshot();
+        assert_eq!(s.state, VmState::Stopped);
+        assert!(s.reclaim_confirmed && s.reason.contains("deadline"));
+        let g = started(&mut m);
+        m.on_event(Event::Died { generation: g, exit: Exit::GuestShutdown });
+        confirm_gone(&mut m, g);
+        assert_eq!(m.snapshot().state, VmState::Stopped);
+        assert!(m.snapshot().reason.is_empty());
+    }
+
+    #[test]
+    fn startup_cleanup_blocks_start_and_never_unloads_an_unreclaimed_instance() {
+        let mut m = Machine::new(false, None);
+        assert_eq!(m.cleanup_on_start(), vec![Action::UnloadDriver { generation: 0 }]);
+        assert!(matches!(m.request_start(Ok(())), Err(Refused::Busy(_))));
+        m.on_event(Event::DriverUnloaded { generation: 1, result: Ok(()) });
+        assert_eq!(m.snapshot().state, VmState::Stopping);
+        m.on_event(Event::DriverUnloaded { generation: 0, result: Ok(()) });
+        assert_eq!(m.snapshot().state, VmState::Stopped);
+        let mut m = Machine::new(false, Some("still running".into()));
+        assert_eq!(m.cleanup_on_start(), vec![Action::CheckReclaim { generation: 0 }]);
+        assert_eq!(m.snapshot().state, VmState::ReclaimUnknown);
+    }
+
+    #[test]
+    fn restored_watch_rechecks_without_duplicate_stop_or_cleanup() {
+        let mut m = Machine::new(false, Some("old process".into()));
+        assert_eq!(m.cleanup_on_start(), vec![Action::CheckReclaim { generation: 0 }]);
+        assert!(m.cleanup_on_start().is_empty(), "only one startup watch");
+        assert!(m.reclaim_check_pending(0));
+        assert!(!m.reclaim_check_pending(1));
+        for _ in 0..3 {
+            assert!(m.request_stop().1.is_empty(), "stop joins the active watch");
+            assert!(matches!(m.request_start(Ok(())), Err(Refused::ReclaimPending(_))));
+            assert_eq!(
+                m.on_event(Event::ReclaimChecked {
+                    generation: 0,
+                    gone: false,
+                    detail: "old process".into(),
+                }),
+                vec![Action::CheckReclaim { generation: 0 }]
+            );
+            assert_eq!(m.snapshot().state, VmState::ReclaimUnknown);
+        }
+        assert!(m.on_event(Event::Died { generation: 0, exit: Exit::Killed }).is_empty());
+        assert!(m
+            .on_event(Event::ReclaimChecked { generation: 1, gone: true, detail: String::new() })
+            .is_empty());
+        assert_eq!(
+            m.on_event(Event::ReclaimChecked { generation: 0, gone: true, detail: String::new() }),
+            vec![Action::UnloadDriver { generation: 0 }]
+        );
+        assert_eq!(m.snapshot().state, VmState::Stopping);
+        assert!(!m.reclaim_check_pending(0));
+        assert!(m.request_stop().1.is_empty());
+        assert!(m
+            .on_event(Event::ReclaimChecked { generation: 0, gone: true, detail: String::new() })
+            .is_empty());
+        m.on_event(Event::DriverUnloaded { generation: 0, result: Ok(()) });
+        assert_eq!(m.snapshot().state, VmState::Stopped);
+        assert!(m.on_event(Event::DriverUnloaded { generation: 0, result: Ok(()) }).is_empty());
+        assert!(m.request_start(Ok(())).is_ok());
+    }
+
+    #[test]
+    fn failure_is_terminal_only_after_cleanup_and_allows_a_new_start() {
+        for starting in [false, true] {
+            let mut m = Machine::new(false, None);
+            let g = if starting {
+                m.request_start(Ok(())).unwrap();
+                m.snapshot().generation
+            } else {
+                started(&mut m)
+            };
+            let event = if starting {
+                Event::StartFailed { generation: g, reason: "denied".into() }
+            } else {
+                Event::Died { generation: g, exit: Exit::Abnormal("crash".into()) }
+            };
+            assert_eq!(m.on_event(event), vec![Action::CheckReclaim { generation: g }]);
+            assert_eq!(
+                m.on_event(Event::ReclaimChecked {
+                    generation: g,
+                    gone: true,
+                    detail: String::new(),
+                }),
+                vec![Action::UnloadDriver { generation: g }]
+            );
+            assert_eq!(m.snapshot().state, VmState::Stopping);
+            assert!(matches!(m.request_start(Ok(())), Err(Refused::Busy(_))));
+            m.on_event(Event::DriverUnloaded { generation: g, result: Ok(()) });
+            assert_eq!(m.snapshot().state, VmState::Failed);
+            assert!(m.snapshot().reclaim_confirmed);
+            assert!(m.request_start(Ok(())).is_ok());
+            assert_eq!(m.snapshot().generation, g + 1);
+        }
+    }
+
+    #[test]
+    fn crash_and_failed_start_wait_for_unload_even_when_unload_fails() {
+        for starting in [false, true] {
+            let mut m = Machine::new(false, None);
+            let g = if starting {
+                m.request_start(Ok(())).unwrap();
+                m.request_stop();
+                m.snapshot().generation
+            } else {
+                started(&mut m)
+            };
+            let event = if starting {
+                Event::StartFailed { generation: g, reason: "start fault".into() }
+            } else {
+                Event::Died { generation: g, exit: Exit::Abnormal("crash".into()) }
+            };
+            assert_eq!(m.on_event(event), vec![Action::CheckReclaim { generation: g }]);
+            assert_eq!(
+                m.on_event(Event::ReclaimChecked {
+                    generation: g,
+                    gone: true,
+                    detail: String::new()
+                }),
+                vec![Action::UnloadDriver { generation: g }]
+            );
+            assert_eq!(m.snapshot().state, VmState::Stopping);
+            m.on_event(Event::DriverUnloaded { generation: g, result: Err("busy module".into()) });
+            assert_eq!(m.snapshot().state, VmState::Stopped);
+            assert!(m.snapshot().reason.contains(if starting { "start fault" } else { "crash" }));
+            assert!(m.snapshot().reason.contains("busy module"));
+        }
     }
 }

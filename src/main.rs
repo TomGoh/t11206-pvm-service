@@ -22,7 +22,8 @@
 //! for products that may not change AVF. Everything else is the same for both.
 //!
 //! A second, read-only interface, `IXKernelVmMonitor`, gives monitor apps the hypervisor's EL2
-//! cycles per CPU and the VM's CPU time (see `monitor`).
+//! cycles per CPU and the VM's CPU time (see `monitor`). It never loads modules; driver lifetime
+//! follows the VM through `WithDriver`, including cleanup on startup and after reclaim.
 
 mod avf;
 mod config;
@@ -41,7 +42,7 @@ use crate::console::Console;
 use crate::controller::{Backend, Controller, Settings};
 use crate::direct::DirectBackend;
 use crate::driver::{DriverLoader, WithDriver};
-use crate::monitor::{online_cpus, El2Monitor, EnsureDriver, ProcFile, VmProcesses, XCORE_STATS};
+use crate::monitor::{online_cpus, El2Monitor, ProcFile, VmProcesses, XCORE_STATS};
 use crate::service::{
     Callbacks, ConsoleClients, ControlService, MonitorService, MONITOR_SERVICE_NAME, SERVICE_NAME,
 };
@@ -88,38 +89,36 @@ fn try_main() -> Result<()> {
     info!("instance config {}: {config:?}", args.config.display());
 
     let console = Console::new();
-    // Loads the hypervisor driver on a start that finds its device node missing, and for the
-    // EL2 monitor.
+    // The VM alone owns loading and cleanup; monitoring never asks the loader for anything.
     let driver = config.driver.as_ref().map(|d| {
         Arc::new(DriverLoader::new(
             config.hypervisor_device.clone(),
             Duration::from_secs(d.timeout_seconds),
-            Box::new(|name, value| system_properties::write(name, value).map_err(|e| format!("{e:#}"))),
+            Box::new(|name, value| {
+                system_properties::write(name, value).map_err(|e| format!("{e:#}"))
+            }),
             Box::new(|name| system_properties::read(name).ok().flatten()),
         ))
-    });
-    let ensure_driver = driver.clone().map(|d| {
-        Box::new(move |reload| if reload { d.reload() } else { d.ensure_loaded() }) as EnsureDriver
     });
     let started = Instant::now();
     let el2 = Arc::new(El2Monitor::new(
         Box::new(ProcFile(PathBuf::from(XCORE_STATS))),
-        ensure_driver,
         Box::new(online_cpus),
         Box::new(move || started.elapsed()),
     ));
     el2.reset();
+    el2.stop_for_unload().ok();
     el2.spawn_idle_stopper();
     match config.backend {
         BackendKind::Avf => {
             let backend = AvfBackend::new(config.clone(), console.clone())
                 .context("Can't prepare the AVF backend")?;
-            serve(config, WithDriver::new(backend, driver), console, el2)
+            serve(config, WithDriver::new(backend, driver, el2.clone()), console, el2)
         }
         BackendKind::Direct => {
             let backend = DirectBackend::new(config.clone(), console.clone())
                 .context("Can't prepare the direct backend")?;
-            serve(config, WithDriver::new(backend, driver), console, el2)
+            serve(config, WithDriver::new(backend, driver, el2.clone()), console, el2)
         }
     }
 }

@@ -1,30 +1,28 @@
 // Copyright 2026 KylinSoft Co., Ltd.
 // SPDX-License-Identifier: Apache-2.0
 
-//! Loading the hypervisor's host driver on the first start after boot.
+//! The VM owns its on-demand host driver; monitoring never asks this loader for anything.
 //!
-//! The driver's modules are not loaded at boot, so the device behaves as before until someone
-//! starts the VM. On a start whose device node is missing, the service asks init to run
-//! `xkernel_vm_loader` by writing a new request number to [`LOAD_PROPERTY`] (the init script
-//! starts the loader on any write). The loader loads the modules listed in its directory in
-//! order, waits for the node, gives it its mode, and writes `loaded <request>` or
-//! `failed <request>: <reason>` to [`STATUS_PROPERTY`]; the start goes on once the result for
-//! this request is there, or fails with the loader's reason or a timeout.
+//! The existing init trigger starts `xkernel_vm_loader` on any value written to [`LOAD_PROPERTY`].
+//! Requests are `load:<pid>.<sequence>` or `unload:<pid>.<sequence>`. The loader captures the
+//! operation and request before acting, then writes `loaded <request>`, `unloaded <request>` or
+//! `failed <request>: <reason>` to [`STATUS_PROPERTY`]. The full request, including its operation,
+//! is echoed and must match exactly. Legacy numeric requests still mean load in the loader.
 //!
-//! The service never loads modules itself: platform policy gives module loading only to
-//! dedicated domains, and a service that answers apps should not hold that right. The property
-//! names are also in `loader/main.rs` and the init script.
+//! One mutex serializes operations. Before writing, the service waits for init's oneshot loader
+//! to leave running/restarting, so a result published just before process exit cannot lose the
+//! next trigger. The whole exchange has the configured deadline. A VM start loads missing
+//! modules on every request (a remaining device may belong to a partial driver); confirmed instance reclaim stops owned EL2 counters then requests unload. Startup
+//! with no leftover instance also unloads. Cleanup errors are reported to the machine, which
+//! releases the switch instead of wedging it; a later instance end retries.
 //!
-//! A start and the monitoring interface (`monitor`) may both need the driver; one loader serves
-//! both and handles one request at a time. The monitoring interface can also ask for a run while
-//! the driver is loaded ([`DriverLoader::reload`]): the loader skips the loaded modules and
-//! prepares the device node and the EL2 counter file again, for a driver someone else loaded. A second request while the loader runs would be lost:
-//! init does not start a oneshot service again while it runs, so that request would never get a
-//! result. A caller that waited for the other's load finds the node and asks for nothing.
+//! The service has no module capability: the existing dedicated loader domain does the work.
+//! Only removable modules disappear; the permanent core and its helper remain until reboot.
 
 use crate::config::exists_without_stat;
 use crate::controller::Backend;
 use crate::machine::Exit;
+use crate::monitor::El2Monitor;
 use log::info;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -32,9 +30,9 @@ use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::{Duration, Instant};
 
-/// Written by the service to ask for a load; init starts the loader on any write.
+/// Requests either operation; the existing init trigger starts the loader on any write.
 pub const LOAD_PROPERTY: &str = "xkernel_vm.load_driver";
-/// Written by the loader: `loaded <request>` or `failed <request>: <reason>`.
+/// Loader result, including the full operation-prefixed request.
 pub const STATUS_PROPERTY: &str = "xkernel_vm.driver_status";
 
 const POLL: Duration = Duration::from_millis(100);
@@ -57,61 +55,61 @@ impl DriverLoader {
         Self { device, timeout, set, get, requests: AtomicU64::new(0), loading: Mutex::new(()) }
     }
 
-    /// Returns once the device node is there, asking for a load if it is not.
+    /// Checks every module on each start, including after a partial unload left the device behind.
     pub fn ensure_loaded(&self) -> Result<(), String> {
-        if exists_without_stat(&self.device) {
-            return Ok(());
-        }
-        self.load(false)
+        self.operate("load")
     }
 
-    /// Asks the loader to run even if the driver is loaded, and waits for its result.
-    pub fn reload(&self) -> Result<(), String> {
-        self.load(true)
+    /// Requests unload even if the main device is absent (a failed load may be partial).
+    pub fn unload(&self) -> Result<(), String> {
+        self.operate("unload")
     }
 
-    fn load(&self, force: bool) -> Result<(), String> {
+    fn operate(&self, operation: &str) -> Result<(), String> {
         let _loading = self.loading.lock().unwrap();
-        // Another caller may have loaded it while this one waited.
-        if !force && exists_without_stat(&self.device) {
-            return Ok(());
-        }
-        // Unique within a boot: a restarted service has another PID.
-        let n = self.requests.fetch_add(1, Ordering::Relaxed) + 1;
-        let request = format!("{}.{n}", std::process::id());
-        (self.set)(LOAD_PROPERTY, &request)
-            .map_err(|e| format!("can't ask for the hypervisor driver: {e}"))?;
-        info!(
-            "{} is missing; asked init to load the hypervisor driver ({request})",
-            self.device.display()
-        );
-        let loaded = format!("loaded {request}");
-        let failed = format!("failed {request}");
         let deadline = Instant::now() + self.timeout;
+        while matches!(
+            (self.get)("init.svc.xkernel_vm_loader").as_deref(),
+            Some("running" | "restarting")
+        ) {
+            if Instant::now() >= deadline {
+                return Err("the driver loader is still running at the deadline".into());
+            }
+            thread::sleep(POLL);
+        }
+        // A device can survive a partial unload while its leaf modules are missing. Always
+        // let the loader check the full list, after the previous oneshot has really exited.
+        let n = self.requests.fetch_add(1, Ordering::Relaxed) + 1;
+        let request = format!("{operation}:{}.{n}", std::process::id());
+        (self.set)(LOAD_PROPERTY, &request)
+            .map_err(|e| format!("can't ask to {operation} the hypervisor driver: {e}"))?;
+        info!("asked init to {operation} the hypervisor driver ({request})");
+        let success =
+            format!("{} {request}", if operation == "load" { "loaded" } else { "unloaded" });
+        let failed = format!("failed {request}:");
         loop {
             match (self.get)(STATUS_PROPERTY) {
-                Some(status) if status == loaded => {
-                    return if exists_without_stat(&self.device) {
-                        info!("hypervisor driver loaded ({request})");
-                        Ok(())
-                    } else {
-                        Err(format!(
-                            "the driver loader reported success but {} is missing",
-                            self.device.display()
-                        ))
-                    };
+                Some(status) if status == success => {
+                    let present = exists_without_stat(&self.device);
+                    if (operation == "load") == present {
+                        return Ok(());
+                    }
+                    return Err(format!(
+                        "the driver loader reported success but {} {}",
+                        self.device.display(),
+                        if present { "still exists" } else { "is missing" }
+                    ));
                 }
                 Some(status) if status.starts_with(&failed) => {
-                    let reason = status[failed.len()..].trim_start_matches(':').trim();
-                    return Err(format!("the hypervisor driver did not load: {reason}"));
+                    return Err(format!(
+                        "the hypervisor driver did not {operation}: {}",
+                        status[failed.len()..].trim()
+                    ));
                 }
                 _ => {}
             }
             if Instant::now() >= deadline {
-                return Err(format!(
-                    "the hypervisor driver did not load within {}s ({STATUS_PROPERTY} has no result for {request})",
-                    self.timeout.as_secs()
-                ));
+                return Err(format!("the hypervisor driver did not {operation} within {}s ({STATUS_PROPERTY} has no result for {request})", self.timeout.as_secs()));
             }
             thread::sleep(POLL);
         }
@@ -122,16 +120,34 @@ impl DriverLoader {
 pub struct WithDriver<B> {
     inner: B,
     loader: Option<Arc<DriverLoader>>,
+    monitor: Arc<El2Monitor>,
 }
 
 impl<B> WithDriver<B> {
-    pub fn new(inner: B, loader: Option<Arc<DriverLoader>>) -> Self {
-        Self { inner, loader }
+    pub fn new(inner: B, loader: Option<Arc<DriverLoader>>, monitor: Arc<El2Monitor>) -> Self {
+        Self { inner, loader, monitor }
     }
 }
 
 impl<B: Backend> Backend for WithDriver<B> {
     type Instance = B::Instance;
+
+    fn has_driver(&self) -> bool {
+        self.loader.is_some()
+    }
+
+    fn unload_driver(&self) -> Result<(), String> {
+        let stopped = self.monitor.stop_for_unload();
+        let unloaded = self.loader.as_ref().map_or(Ok(()), |loader| loader.unload());
+        match (stopped, unloaded) {
+            (_, Err(reason)) => Err(reason),
+            (Err(reason), Ok(())) => {
+                log::warn!("{reason}; driver unload completed");
+                Ok(())
+            }
+            _ => Ok(()),
+        }
+    }
 
     fn create_and_start(
         &self,
@@ -141,6 +157,7 @@ impl<B: Backend> Backend for WithDriver<B> {
         if let Some(loader) = &self.loader {
             loader.ensure_loaded()?;
         }
+        self.monitor.allow();
         self.inner.create_and_start(generation, on_death)
     }
 }
@@ -204,12 +221,38 @@ mod tests {
     }
 
     #[test]
-    fn a_present_device_asks_nothing() {
+    fn a_present_device_still_requests_a_complete_module_check() {
         let rig = Rig::new("present");
         fs::write(rig.device(), b"").unwrap();
-        let loader = rig.loader(500, |_, _, _| panic!("asked for a load"));
+        let loader = rig.loader(500, |_, props, request| {
+            assert!(request.starts_with("load:"));
+            status(props, format!("loaded {request}"));
+        });
         assert_eq!(loader.ensure_loaded(), Ok(()));
-        assert!(rig.props.lock().unwrap().is_empty());
+        assert!(rig.props.lock().unwrap()[LOAD_PROPERTY].starts_with("load:"));
+    }
+
+    #[test]
+    fn a_partial_unload_with_a_remaining_device_is_repaired_on_next_start() {
+        let rig = Rig::new("partial");
+        fs::write(rig.device(), b"").unwrap();
+        fs::write(rig.dir.join("vcpu"), b"").unwrap();
+        let loader = rig.loader(500, |device, props, request| {
+            let leaf = device.parent().unwrap().join("vcpu");
+            if request.starts_with("unload:") {
+                fs::remove_file(leaf).unwrap();
+                status(props, format!("failed {request}: xhyper_rsc_mgr busy"));
+            } else {
+                fs::write(leaf, b"").unwrap();
+                status(props, format!("loaded {request}"));
+            }
+        });
+        assert!(loader.unload().is_err());
+        assert!(rig.device().exists());
+        assert!(!rig.dir.join("vcpu").exists());
+        assert_eq!(loader.ensure_loaded(), Ok(()));
+        assert!(rig.dir.join("vcpu").exists());
+        assert!(rig.props.lock().unwrap()[LOAD_PROPERTY].starts_with("load:"));
     }
 
     #[test]
@@ -226,7 +269,7 @@ mod tests {
         });
         assert_eq!(loader.ensure_loaded(), Ok(()));
         let props = rig.props.lock().unwrap();
-        assert_eq!(props[LOAD_PROPERTY], format!("{}.1", std::process::id()));
+        assert_eq!(props[LOAD_PROPERTY], format!("load:{}.1", std::process::id()));
     }
 
     #[test]
@@ -252,39 +295,45 @@ mod tests {
     }
 
     #[test]
-    fn a_reload_asks_even_with_the_node_there() {
-        let rig = Rig::new("reload");
+    fn unload_uses_the_same_trigger_and_its_own_result() {
+        let rig = Rig::new("unload");
         fs::write(rig.device(), b"").unwrap();
-        let loader = rig.loader(1000, |_, props, request| {
-            status(props, format!("loaded {request}"));
+        let loader = rig.loader(1000, |device, props, request| {
+            assert!(request.starts_with("unload:"));
+            fs::remove_file(device).unwrap();
+            status(props, format!("unloaded {request}"));
         });
-        assert_eq!(loader.ensure_loaded(), Ok(()));
-        assert!(rig.props.lock().unwrap().is_empty(), "loaded: no request");
-        assert_eq!(loader.reload(), Ok(()));
-        assert_eq!(rig.props.lock().unwrap()[LOAD_PROPERTY], format!("{}.1", std::process::id()));
+        assert_eq!(loader.unload(), Ok(()));
+        assert_eq!(
+            rig.props.lock().unwrap()[LOAD_PROPERTY],
+            format!("unload:{}.1", std::process::id())
+        );
     }
 
     #[test]
-    fn concurrent_callers_share_one_request() {
+    fn unload_failure_and_timeout_are_reported_even_without_a_device() {
+        let rig = Rig::new("unloadfail");
+        let loader =
+            rig.loader(300, |_, props, request| status(props, format!("failed {request}: busy")));
+        assert!(loader.unload().unwrap_err().ends_with("unload: busy"));
+        let loader =
+            rig.loader(100, |_, props, request| status(props, format!("loaded {request}")));
+        assert!(loader.unload().unwrap_err().contains("did not unload within"));
+    }
+
+    #[test]
+    fn concurrent_callers_serialize_complete_load_checks() {
         let rig = Rig::new("concurrent");
         let requests = Arc::new(Mutex::new(Vec::new()));
         let busy = Arc::new(std::sync::atomic::AtomicBool::new(false));
         let seen = requests.clone();
         let loader = Arc::new(rig.loader(1000, move |device, props, request| {
+            assert!(!busy.swap(true, Ordering::SeqCst), "overlapping loader requests");
             seen.lock().unwrap().push(request.to_string());
-            // Like init: a oneshot service that still runs is not started again, so a request
-            // made meanwhile gets no result.
-            if busy.swap(true, Ordering::SeqCst) {
-                return;
-            }
-            let (device, props, request) = (device.clone(), props.clone(), request.to_string());
-            let busy = busy.clone();
-            thread::spawn(move || {
-                thread::sleep(Duration::from_millis(200));
-                fs::write(&device, b"").unwrap();
-                status(&props, format!("loaded {request}"));
-                busy.store(false, Ordering::SeqCst);
-            });
+            thread::sleep(Duration::from_millis(100));
+            fs::write(device, b"").unwrap();
+            status(props, format!("loaded {request}"));
+            busy.store(false, Ordering::SeqCst);
         }));
         let both = Arc::new(std::sync::Barrier::new(2));
         let (other, gate) = (loader.clone(), both.clone());
@@ -295,7 +344,7 @@ mod tests {
         both.wait();
         assert_eq!(loader.ensure_loaded(), Ok(()));
         assert_eq!(waiter.join().unwrap(), Ok(()));
-        assert_eq!(requests.lock().unwrap().len(), 1);
+        assert_eq!(requests.lock().unwrap().len(), 2);
     }
 
     #[test]
@@ -307,6 +356,26 @@ mod tests {
         assert!(loader.ensure_loaded().unwrap_err().contains("is missing"));
         assert!(loader.ensure_loaded().is_err());
         let props = rig.props.lock().unwrap();
-        assert_eq!(props[LOAD_PROPERTY], format!("{}.2", std::process::id()));
+        assert_eq!(props[LOAD_PROPERTY], format!("load:{}.2", std::process::id()));
+    }
+    #[test]
+    fn present_device_waits_for_a_timed_out_unloader_before_a_new_start() {
+        let rig = Rig::new("unload-running");
+        fs::write(rig.device(), b"").unwrap();
+        rig.props.lock().unwrap().insert("init.svc.xkernel_vm_loader".into(), "running".into());
+        let loader = Arc::new(rig.loader(500, |_, props, request| {
+            status(props, format!("loaded {request}"));
+        }));
+        let other = loader.clone();
+        let waiter = thread::spawn(move || other.ensure_loaded());
+        thread::sleep(Duration::from_millis(150));
+        assert!(!waiter.is_finished(), "must wait for the previous unload");
+        assert!(!rig.props.lock().unwrap().contains_key(LOAD_PROPERTY));
+        rig.props.lock().unwrap().insert("init.svc.xkernel_vm_loader".into(), "stopped".into());
+        assert_eq!(waiter.join().unwrap(), Ok(()));
+        rig.props.lock().unwrap().insert("init.svc.xkernel_vm_loader".into(), "running".into());
+        let previous = rig.props.lock().unwrap()[LOAD_PROPERTY].clone();
+        assert!(loader.ensure_loaded().unwrap_err().contains("still running"));
+        assert_eq!(rig.props.lock().unwrap()[LOAD_PROPERTY], previous);
     }
 }

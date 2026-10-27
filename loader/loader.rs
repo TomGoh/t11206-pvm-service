@@ -10,6 +10,13 @@
 //! is skipped, so a load that failed half-way can be retried. The first failure stops the load.
 //! After the last module the loader waits for the device node, which ueventd creates, and gives
 //! it its owner and mode.
+//!
+//! The same property trigger handles `load:<pid>.<sequence>` and `unload:<pid>.<sequence>`;
+//! legacy unprefixed requests still load. Unload checks only `/sys/module/<name>` existence,
+//! calls `delete_module(name, O_NONBLOCK)` in reverse list order, and attempts every module even
+//! after a failure. Busy errors for `xhyper` (permanent) and `xhyper_hypercall` (held by it) are
+//! expected. All other listed modules plus both data nodes must be absent for success. Neither
+//! module metadata nor a global module listing is read, so existing loader permissions suffice.
 
 use std::io;
 use std::path::Path;
@@ -56,12 +63,31 @@ pub fn parse_list(text: &str) -> Result<Vec<Module>, String> {
     Ok(modules)
 }
 
-/// The system calls the load needs.
+/// A request operation, encoded without a new init trigger.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Operation {
+    Load,
+    Unload,
+}
+
+pub fn operation(request: &str) -> Result<Operation, String> {
+    if request.starts_with("unload:") {
+        Ok(Operation::Unload)
+    } else if request.starts_with("load:") || !request.contains(':') {
+        Ok(Operation::Load)
+    } else {
+        Err("unknown driver operation".into())
+    }
+}
+
+/// The system calls the loader needs; no metadata beneath module directories is read.
 pub trait Kernel {
     fn is_loaded(&self, name: &str) -> bool;
     /// Loads the module file with its parameters (`finit_module`).
     fn load(&self, path: &Path, params: &str) -> io::Result<()>;
     fn node_exists(&self) -> bool;
+    fn monitor_exists(&self) -> bool;
+    fn unload(&self, name: &str) -> io::Result<()>;
     /// Gives the device node its owner and mode.
     fn prepare_node(&self) -> io::Result<()>;
     fn sleep(&self, duration: Duration);
@@ -102,6 +128,44 @@ pub fn load_all(
     Ok(loaded)
 }
 
+/// Attempts all listed modules in reverse dependency order. Permanent core busy errors are
+/// accepted, but a busy removable module, any other syscall error, or remaining data is failure.
+pub fn unload_all(modules: &[Module], kernel: &dyn Kernel) -> Result<Vec<String>, String> {
+    let mut unloaded = Vec::new();
+    let mut failures = Vec::new();
+    for module in modules.iter().rev() {
+        let name = module.name();
+        if !kernel.is_loaded(&name) {
+            continue;
+        }
+        match kernel.unload(&name) {
+            Ok(()) => unloaded.push(name),
+            Err(e)
+                if (name == "xhyper" || name == "xhyper_hypercall")
+                    && matches!(e.raw_os_error(), Some(libc::EBUSY) | Some(libc::EWOULDBLOCK)) => {}
+            Err(e) if e.raw_os_error() == Some(libc::ENOENT) => {}
+            Err(e) => failures.push(format!("{name}: {e}")),
+        }
+    }
+    for module in modules {
+        let name = module.name();
+        if name != "xhyper" && name != "xhyper_hypercall" && kernel.is_loaded(&name) {
+            failures.push(format!("{name} is still loaded"));
+        }
+    }
+    if kernel.node_exists() {
+        failures.push("/dev/xhyper still exists".into());
+    }
+    if kernel.monitor_exists() {
+        failures.push("/proc/xcore_stats still exists".into());
+    }
+    if failures.is_empty() {
+        Ok(unloaded)
+    } else {
+        Err(failures.join("; "))
+    }
+}
+
 /// `text` cut to at most `max` bytes on a character boundary (system property values are short).
 pub fn clip(text: &str, max: usize) -> &str {
     if text.len() <= max {
@@ -127,6 +191,10 @@ mod tests {
         fail: Option<(&'static str, i32)>,
         node_after_polls: Cell<i32>,
         prepared: Cell<bool>,
+        unloads: RefCell<Vec<String>>,
+        unload_fail: Option<(&'static str, i32)>,
+        keep_nodes: bool,
+        keep_module: bool,
     }
 
     impl Kernel for FakeKernel {
@@ -143,6 +211,27 @@ mod tests {
             }
             self.present.borrow_mut().push(file.trim_end_matches(".ko").to_string());
             Ok(())
+        }
+        fn unload(&self, name: &str) -> io::Result<()> {
+            self.unloads.borrow_mut().push(name.into());
+            if let Some((bad, errno)) = self.unload_fail {
+                if name == bad {
+                    return Err(io::Error::from_raw_os_error(errno));
+                }
+            }
+            if name == "xhyper" || name == "xhyper_hypercall" {
+                return Err(io::Error::from_raw_os_error(libc::EBUSY));
+            }
+            if !self.keep_module {
+                self.present.borrow_mut().retain(|n| n != name);
+            }
+            if name == "xhyper_rsc_mgr" && !self.keep_nodes {
+                self.node_after_polls.set(i32::MAX);
+            }
+            Ok(())
+        }
+        fn monitor_exists(&self) -> bool {
+            self.keep_nodes
         }
         fn node_exists(&self) -> bool {
             let left = self.node_after_polls.get();
@@ -236,5 +325,96 @@ mod tests {
         assert_eq!(clip("abc", 5), "abc");
         assert_eq!(clip("ab模块", 4), "ab");
         assert_eq!(clip("ab模块", 5), "ab模");
+    }
+    const FULL_LIST: &str = include_str!("../etc/modules.load");
+
+    fn unloading_kernel() -> FakeKernel {
+        let k = FakeKernel::default();
+        k.present.borrow_mut().extend(parse_list(FULL_LIST).unwrap().iter().map(Module::name));
+        k
+    }
+
+    #[test]
+    fn unload_is_reverse_order_and_leaves_only_permanent_dependencies() {
+        let k = unloading_kernel();
+        let result = unload_all(&parse_list(FULL_LIST).unwrap(), &k).unwrap();
+        assert_eq!(
+            result,
+            [
+                "xhyper_ioeventfd",
+                "xhyper_irqfd",
+                "xhyper_vcpu",
+                "xhyper_rsc_mgr",
+                "xhyper_platform_hooks"
+            ]
+        );
+        assert_eq!(
+            *k.unloads.borrow(),
+            [
+                "xhyper_ioeventfd",
+                "xhyper_irqfd",
+                "xhyper_vcpu",
+                "xhyper_rsc_mgr",
+                "xhyper_platform_hooks",
+                "xhyper",
+                "xhyper_hypercall"
+            ]
+        );
+        assert_eq!(*k.present.borrow(), ["xhyper_hypercall", "xhyper"]);
+        // A second end-of-instance retries even if only the permanent modules remain.
+        assert!(unload_all(&parse_list(FULL_LIST).unwrap(), &k).is_ok());
+    }
+
+    #[test]
+    fn removable_busy_is_failure_but_later_modules_are_still_attempted() {
+        let mut k = unloading_kernel();
+        k.unload_fail = Some(("xhyper_vcpu", libc::EWOULDBLOCK));
+        let e = unload_all(&parse_list(FULL_LIST).unwrap(), &k).unwrap_err();
+        assert!(e.contains("xhyper_vcpu"), "{e}");
+        assert_eq!(k.unloads.borrow().len(), 7);
+    }
+
+    #[test]
+    fn loading_after_partial_unload_restores_missing_leaf_modules() {
+        let mut k = unloading_kernel();
+        k.unload_fail = Some(("xhyper_rsc_mgr", libc::EWOULDBLOCK));
+        let modules = parse_list(FULL_LIST).unwrap();
+        assert!(unload_all(&modules, &k).is_err());
+        assert!(k.node_exists(), "resource manager and its device survived");
+        assert!(!k.is_loaded("xhyper_vcpu"));
+        let loaded = load_all(Path::new("/m"), &modules, &k, Duration::from_secs(1)).unwrap();
+        assert!(loaded.iter().any(|m| m == "xhyper_vcpu"));
+        assert!(modules.iter().all(|m| k.is_loaded(&m.name())));
+        assert!(k.prepared.get());
+    }
+
+    #[test]
+    fn unload_checks_remaining_modules_and_both_nodes_and_skips_absent_modules() {
+        let mut k = unloading_kernel();
+        k.keep_nodes = true;
+        k.keep_module = true;
+        let e = unload_all(&parse_list(FULL_LIST).unwrap(), &k).unwrap_err();
+        for reason in ["still loaded", "/dev/xhyper still exists", "/proc/xcore_stats still exists"]
+        {
+            assert!(e.contains(reason), "{e}");
+        }
+        let k = FakeKernel { node_after_polls: Cell::new(i32::MAX), ..FakeKernel::default() };
+        assert!(unload_all(&parse_list(FULL_LIST).unwrap(), &k).is_ok());
+        assert!(k.unloads.borrow().is_empty());
+    }
+
+    #[test]
+    fn permanent_permission_error_is_not_accepted_as_busy() {
+        let mut k = unloading_kernel();
+        k.unload_fail = Some(("xhyper", libc::EPERM));
+        assert!(unload_all(&parse_list(FULL_LIST).unwrap(), &k).unwrap_err().contains("xhyper:"));
+    }
+
+    #[test]
+    fn request_operations_are_explicit_with_legacy_load_support() {
+        assert_eq!(operation("load:1.2"), Ok(Operation::Load));
+        assert_eq!(operation("unload:1.2"), Ok(Operation::Unload));
+        assert_eq!(operation("1.2"), Ok(Operation::Load));
+        assert!(operation("bad:1.2").is_err());
     }
 }

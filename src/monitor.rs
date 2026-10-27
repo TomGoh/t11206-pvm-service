@@ -11,14 +11,10 @@
 //! (while they run, the Host cannot count with simpleperf). A stopped monitor still lists every
 //! CPU, with the counts frozen; a restart continues from them. [`El2Monitor`]:
 //!
-//! - starts the counters on the first read, and loads the driver first if the file is missing
-//!   (the driver is loaded on demand, as for a VM start). The load runs without the monitor's
-//!   lock: it can take the loader's whole timeout. If the start is refused for permission (a
-//!   driver loaded by something else leaves the file 0644 root root), the loader is asked once
-//!   more; it skips the loaded modules and gives the file to this service.
-//! - remembers a failed load for [`LOAD_BACKOFF`] and a failed start for [`START_BACKOFF`], and
-//!   answers with the remembered reason meanwhile, so a polling client does not make the loader
-//!   run, or the driver issue global controls, at its polling rate.
+//! - starts the counters on the first read only while the VM's driver lifecycle permits it.
+//!   Missing files report "driver not loaded: the VM is off" and reset the remembered state.
+//!   Reads never ask the loader to load modules or fix permissions. Start failures are cached
+//!   for [`START_BACKOFF`], so client polling does not retry global controls at its polling rate.
 //! - writes `1` again, at most every [`RESTART_INTERVAL`], only when the counters need it: an
 //!   online CPU's line is missing in [`MISSING_READINGS`] readings in a row (its counter failed,
 //!   e.g. a refused freeze around deep idle), the read fails, or no listed CPU's count moved for
@@ -29,6 +25,9 @@
 //! - stops the counters once no client has read for [`IDLE_STOP`] ([`El2Monitor::stop_if_idle`],
 //!   run by a thread; a failed stop is retried up to [`STOP_ATTEMPTS`] times), and at service
 //!   start ([`El2Monitor::reset`]) in case an earlier run of the service left them running.
+//! - serializes reads and controls with the state lock. Before unloading, `stop_for_unload`
+//!   prevents new reads from starting counters and stops those owned by this monitor; the next
+//!   VM start calls `allow` after loading, with fresh backoff/reference state.
 //!
 //! The cycles are counted at the CPU's clock of the moment, so a share of time needs a frequency;
 //! which one is the client's choice. The driver numbers CPUs by the hypervisor's CPU id; on T11206 it equals Linux's CPU number (pinning Linux
@@ -67,8 +66,6 @@ pub const IDLE_STOP: Duration = Duration::from_secs(15);
 pub const RESTART_INTERVAL: Duration = Duration::from_secs(5);
 /// How long a failed start is answered from memory.
 pub const START_BACKOFF: Duration = RESTART_INTERVAL;
-/// How long a failed driver load is answered from memory.
-pub const LOAD_BACKOFF: Duration = Duration::from_secs(30);
 /// Readings in a row with an online CPU missing before the counters are restarted.
 pub const MISSING_READINGS: u32 = 2;
 /// Counts that did not move for this long mean the counters are not running.
@@ -166,9 +163,6 @@ impl StatsFile for ProcFile {
     }
 }
 
-/// Loads the host driver as for a start (`driver::DriverLoader`); with `true`, asks the loader to
-/// run even if the driver is loaded, to prepare [`XCORE_STATS`] again.
-pub type EnsureDriver = Box<dyn Fn(bool) -> Result<(), String> + Send + Sync>;
 /// The CPUs Linux has online ([`online_cpus`]).
 pub type OnlineCpus = Box<dyn Fn() -> Option<Vec<u32>> + Send + Sync>;
 /// A monotonic clock; only differences matter.
@@ -184,7 +178,7 @@ struct State {
     missing: u32,
     /// An earlier reading to tell whether the counts move, and when it was taken.
     reference: Option<(Duration, Vec<CycleSample>)>,
-    load_failure: Option<(Duration, String)>,
+    blocked: bool,
     start_failure: Option<(Duration, String)>,
     stop_failures: u32,
 }
@@ -204,20 +198,14 @@ fn recent(
 /// Starts, reads and stops the EL2 counters for the monitoring interface.
 pub struct El2Monitor {
     file: Box<dyn StatsFile>,
-    ensure_driver: Option<EnsureDriver>,
     online: OnlineCpus,
     now: Clock,
     state: Mutex<State>,
 }
 
 impl El2Monitor {
-    pub fn new(
-        file: Box<dyn StatsFile>,
-        ensure_driver: Option<EnsureDriver>,
-        online: OnlineCpus,
-        now: Clock,
-    ) -> Self {
-        Self { file, ensure_driver, online, now, state: Mutex::new(State::default()) }
+    pub fn new(file: Box<dyn StatsFile>, online: OnlineCpus, now: Clock) -> Self {
+        Self { file, online, now, state: Mutex::new(State::default()) }
     }
 
     /// Stops counters an earlier run of this service may have left running.
@@ -230,27 +218,46 @@ impl El2Monitor {
         }
     }
 
-    /// Reads the counters, starting them (and loading the driver) first if needed.
+    /// Permits monitoring after the VM start has loaded the driver; starts from fresh state.
+    pub fn allow(&self) {
+        *self.state.lock().unwrap() = State::default();
+    }
+
+    /// Blocks monitoring until the next start, stopping counters this service owns before unload.
+    /// The caller still unloads if the write fails: the driver's exit synchronously stops them.
+    pub fn stop_for_unload(&self) -> Result<(), String> {
+        let mut state = self.state.lock().unwrap();
+        let result = if state.running && self.file.exists() {
+            self.file
+                .write("0\n")
+                .map_err(|e| format!("can't stop EL2 counters before unload: {e}"))
+        } else {
+            Ok(())
+        };
+        *state = State { blocked: true, ..State::default() };
+        result
+    }
+
+    /// Reads existing counters, starting them if permitted. It never loads or prepares a driver.
     pub fn read(&self) -> El2Reading {
         let now = (self.now)();
-        if let Err(reason) = self.ensure_file(now) {
-            return El2Reading::Unavailable(reason);
+        let mut state = self.state.lock().unwrap();
+        if !self.file.exists() {
+            let blocked = state.blocked;
+            *state = State { blocked, ..State::default() };
+            return El2Reading::Unavailable("driver not loaded: the VM is off".into());
         }
-        let start = {
-            let mut state = self.state.lock().unwrap();
-            state.last_read = now;
-            if !state.running {
-                if let Some(reason) = recent(&state.start_failure, now, START_BACKOFF) {
-                    return El2Reading::Unavailable(reason);
-                }
+        if state.blocked {
+            return El2Reading::Unavailable(
+                "the VM is off: driver cleanup in progress or completed".into(),
+            );
+        }
+        state.last_read = now;
+        if !state.running {
+            if let Some(reason) = recent(&state.start_failure, now, START_BACKOFF) {
+                return El2Reading::Unavailable(reason);
             }
-            !state.running
-        };
-        if start {
-            // Not under the lock: a refused start may wait for the loader.
-            let result = self.start();
-            let mut state = self.state.lock().unwrap();
-            match result {
+            match self.file.write("1\n") {
                 Ok(()) => {
                     info!("started the EL2 counters");
                     *state = State {
@@ -261,9 +268,9 @@ impl El2Monitor {
                     };
                 }
                 Err(e) => {
-                    warn!("{e}");
-                    state.start_failure = Some((now, e.clone()));
-                    return El2Reading::Unavailable(e);
+                    let reason = format!("can't start the EL2 counters: {e}");
+                    state.start_failure = Some((now, reason.clone()));
+                    return El2Reading::Unavailable(reason);
                 }
             }
         }
@@ -272,7 +279,6 @@ impl El2Monitor {
             .read()
             .map_err(|e| format!("can't read {XCORE_STATS}: {e}"))
             .and_then(|text| parse_xcore_stats(&text));
-        let mut state = self.state.lock().unwrap();
         let why = match &reading {
             Err(e) => Some(e.clone()),
             Ok(samples) => self.restart_reason(&mut state, now, samples),
@@ -282,8 +288,7 @@ impl El2Monitor {
                 match self.file.write("1\n") {
                     Ok(()) => info!("restarted the EL2 counters: {why}"),
                     Err(e) => {
-                        // The next read goes through the start, with its backoff and its
-                        // second chance for a file the service may not write.
+                        // The next read retries the start with its backoff.
                         warn!("can't restart the EL2 counters ({why}): {e}");
                         state.running = false;
                     }
@@ -297,58 +302,6 @@ impl El2Monitor {
             Ok(samples) => El2Reading::Counting(samples),
             Err(e) => El2Reading::Unavailable(e),
         }
-    }
-
-    /// Makes sure the counter file exists, loading the driver if not; failures are remembered
-    /// for [`LOAD_BACKOFF`].
-    fn ensure_file(&self, now: Duration) -> Result<(), String> {
-        if self.file.exists() {
-            return Ok(());
-        }
-        if let Some(reason) = recent(&self.state.lock().unwrap().load_failure, now, LOAD_BACKOFF) {
-            return Err(reason);
-        }
-        // Not under the lock: a load can take the loader's whole timeout. The loader handles one
-        // request at a time, so concurrent readers wait for the same load.
-        let loaded = match &self.ensure_driver {
-            Some(ensure) => ensure(false),
-            None => Ok(()),
-        };
-        let result = loaded.and_then(|()| {
-            self.file.exists().then_some(()).ok_or_else(|| {
-                format!("the hypervisor driver offers no EL2 monitor ({XCORE_STATS} is missing)")
-            })
-        });
-        let mut state = self.state.lock().unwrap();
-        match result {
-            Ok(()) => {
-                // A driver loaded just now starts with its counters stopped.
-                state.running = false;
-                state.load_failure = None;
-                Ok(())
-            }
-            Err(e) => {
-                state.load_failure = Some((now, e.clone()));
-                Err(e)
-            }
-        }
-    }
-
-    /// Writes `1`; on a permission error asks the loader once to prepare the file.
-    fn start(&self) -> Result<(), String> {
-        let error = match self.file.write("1\n") {
-            Ok(()) => return Ok(()),
-            Err(e) => e,
-        };
-        let Some(ensure) = self.ensure_driver.as_ref() else {
-            return Err(format!("can't start the EL2 counters: {error}"));
-        };
-        if error.kind() != io::ErrorKind::PermissionDenied {
-            return Err(format!("can't start the EL2 counters: {error}"));
-        }
-        info!("{XCORE_STATS} refused the start ({error}): asking the loader to prepare it");
-        ensure(true).map_err(|e| format!("can't start the EL2 counters ({error}): {e}"))?;
-        self.file.write("1\n").map_err(|e| format!("can't start the EL2 counters: {e}"))
     }
 
     /// Why a complete reading still asks for a restart, if it does.
@@ -545,7 +498,6 @@ mod tests {
     use super::*;
     use std::collections::BTreeMap;
     use std::sync::atomic::{AtomicU64, Ordering};
-    use std::time::Instant;
 
     /// A stand-in for the driver: `1` starts and `0` stops the counters; while they run, every
     /// read adds 1000 cycles to each listed CPU. Writes are recorded; a write can be made to fail.
@@ -606,7 +558,7 @@ mod tests {
     }
 
     /// CPUs 0 and 1 listed and online; the clock counts tenths of a second.
-    fn rig(exists: bool, ensure_driver: Option<EnsureDriver>) -> Rig {
+    fn rig(exists: bool) -> Rig {
         let fake = Fake::default();
         {
             let mut d = fake.0.lock().unwrap();
@@ -618,7 +570,6 @@ mod tests {
         let (o, c) = (online.clone(), clock.clone());
         let monitor = Arc::new(El2Monitor::new(
             Box::new(fake.clone()),
-            ensure_driver,
             Box::new(move || o.lock().unwrap().clone()),
             Box::new(move || Duration::from_millis(c.load(Ordering::SeqCst) * 100)),
         ));
@@ -679,14 +630,14 @@ mod tests {
 
     #[test]
     fn running_counters_are_started_once_however_often_they_are_read() {
-        let r = rig(true, None);
+        let r = rig(true);
         r.poll(60, 500);
         assert_eq!(r.writes(), ["1\n"]);
     }
 
     #[test]
     fn an_offline_cpu_is_not_missing() {
-        let r = rig(true, None);
+        let r = rig(true);
         r.poll(2, 500);
         // CPU 1 goes offline: the driver stops listing it.
         r.driver().cycles.remove(&1);
@@ -697,7 +648,7 @@ mod tests {
 
     #[test]
     fn an_online_cpu_missing_twice_in_a_row_restarts_at_most_every_interval() {
-        let r = rig(true, None);
+        let r = rig(true);
         r.poll(6, 1000);
         // CPU 1 is online but its line is gone (its counter failed).
         r.driver().cycles.remove(&1);
@@ -719,7 +670,7 @@ mod tests {
 
     #[test]
     fn a_single_missing_reading_does_not_restart() {
-        let r = rig(true, None);
+        let r = rig(true);
         r.poll(6, 1000);
         r.driver().cycles.remove(&1);
         r.poll(1, 1000);
@@ -730,7 +681,7 @@ mod tests {
 
     #[test]
     fn counters_stopped_from_outside_are_started_again() {
-        let r = rig(true, None);
+        let r = rig(true);
         r.poll(6, 500);
         // Someone writes 0 (e.g. el2-monitor.sh stop); the readings stay complete but frozen.
         r.driver().running = false;
@@ -743,7 +694,7 @@ mod tests {
 
     #[test]
     fn a_failed_read_restarts_and_reports() {
-        let r = rig(true, None);
+        let r = rig(true);
         r.driver().garbage = true;
         assert!(matches!(r.monitor.read(), El2Reading::Unavailable(e) if e.contains("header")));
         r.advance(5);
@@ -753,7 +704,7 @@ mod tests {
 
     #[test]
     fn idle_counters_stop_and_the_next_read_starts_them_again() {
-        let r = rig(true, None);
+        let r = rig(true);
         r.monitor.read();
         r.advance(IDLE_STOP.as_secs() - 1);
         assert!(!r.monitor.stop_if_idle());
@@ -767,7 +718,7 @@ mod tests {
 
     #[test]
     fn a_failed_idle_stop_is_retried_then_given_up() {
-        let r = rig(true, None);
+        let r = rig(true);
         r.monitor.read();
         r.advance(IDLE_STOP.as_secs());
         r.driver().fail = Some(libc::EIO);
@@ -782,7 +733,7 @@ mod tests {
 
     #[test]
     fn never_started_counters_are_not_stopped() {
-        let r = rig(true, None);
+        let r = rig(true);
         r.advance(100);
         assert!(!r.monitor.stop_if_idle());
         assert!(r.writes().is_empty());
@@ -790,7 +741,7 @@ mod tests {
 
     #[test]
     fn reset_stops_leftover_counters_only_if_the_driver_is_there() {
-        let r = rig(false, None);
+        let r = rig(false);
         r.monitor.reset();
         assert!(r.writes().is_empty());
         r.driver().exists = true;
@@ -798,67 +749,51 @@ mod tests {
         assert_eq!(r.writes(), ["0\n"]);
     }
 
-    /// A loader that records its calls and runs `effect` on the fake driver.
-    fn loader(
-        fake: &Arc<Mutex<Option<Fake>>>,
-        calls: &Arc<Mutex<Vec<bool>>>,
-        effect: impl Fn(&mut FakeDriver, bool) -> Result<(), String> + Send + Sync + 'static,
-    ) -> EnsureDriver {
-        let (fake, calls) = (fake.clone(), calls.clone());
-        Box::new(move |force| {
-            calls.lock().unwrap().push(force);
-            let fake = fake.lock().unwrap().clone().unwrap();
-            let mut d = fake.0.lock().unwrap();
-            effect(&mut d, force)
-        })
-    }
-
-    fn rig_with_loader(
-        exists: bool,
-        effect: impl Fn(&mut FakeDriver, bool) -> Result<(), String> + Send + Sync + 'static,
-    ) -> (Rig, Arc<Mutex<Vec<bool>>>) {
-        let slot = Arc::new(Mutex::new(None));
-        let calls = Arc::new(Mutex::new(Vec::new()));
-        let r = rig(exists, Some(loader(&slot, &calls, effect)));
-        *slot.lock().unwrap() = Some(r.fake.clone());
-        (r, calls)
-    }
-
     #[test]
-    fn a_missing_file_loads_the_driver_then_starts() {
-        let (r, calls) = rig_with_loader(false, |d, _| {
-            d.exists = true;
-            Ok(())
-        });
+    fn a_missing_file_never_loads_or_writes_and_a_later_driver_starts_fresh() {
+        let r = rig(false);
+        for _ in 0..3 {
+            assert_eq!(
+                r.monitor.read(),
+                El2Reading::Unavailable("driver not loaded: the VM is off".into())
+            );
+        }
+        assert_eq!(r.driver().attempts, 0);
+        r.driver().exists = true;
         assert!(matches!(r.monitor.read(), El2Reading::Counting(_)));
-        assert_eq!(r.writes(), ["1\n"]);
-        assert_eq!(*calls.lock().unwrap(), [false]);
+        r.driver().exists = false;
+        assert!(matches!(r.monitor.read(), El2Reading::Unavailable(_)));
+        r.driver().exists = true;
+        assert!(matches!(r.monitor.read(), El2Reading::Counting(_)));
+        assert_eq!(r.writes(), ["1\n", "1\n"]);
     }
 
     #[test]
-    fn a_failed_driver_load_is_answered_from_memory_for_a_while() {
-        let (r, calls) = rig_with_loader(false, |_, _| Err("did not load: x".into()));
-        assert_eq!(r.monitor.read(), El2Reading::Unavailable("did not load: x".into()));
-        r.poll(LOAD_BACKOFF.as_secs() - 1, 500);
-        assert_eq!(calls.lock().unwrap().len(), 1);
-        r.advance(1);
+    fn unload_stops_owned_counters_and_blocks_reads_until_next_start() {
+        let r = rig(true);
         r.monitor.read();
-        assert_eq!(calls.lock().unwrap().len(), 2);
-        assert!(r.writes().is_empty());
+        r.monitor.stop_for_unload().unwrap();
+        assert!(matches!(r.monitor.read(), El2Reading::Unavailable(_)));
+        assert_eq!(r.writes(), ["1\n", "0\n"]);
+        r.monitor.allow();
+        assert!(matches!(r.monitor.read(), El2Reading::Counting(_)));
+        assert_eq!(r.writes(), ["1\n", "0\n", "1\n"]);
     }
 
     #[test]
-    fn a_driver_without_the_monitor_is_reported() {
-        let (r, _) = rig_with_loader(false, |_, _| Ok(()));
+    fn permission_denied_never_requests_a_loader_and_is_backed_off() {
+        let r = rig(true);
+        r.driver().fail = Some(libc::EACCES);
         assert!(
-            matches!(r.monitor.read(), El2Reading::Unavailable(e) if e.contains("no EL2 monitor"))
+            matches!(r.monitor.read(), El2Reading::Unavailable(e) if e.contains("can't start"))
         );
-        assert!(r.writes().is_empty());
+        r.monitor.read();
+        assert_eq!(r.driver().attempts, 1);
     }
 
     #[test]
     fn a_refused_start_is_tried_once_per_interval() {
-        let r = rig(true, None);
+        let r = rig(true);
         r.driver().fail = Some(libc::EBUSY);
         assert!(
             matches!(r.monitor.read(), El2Reading::Unavailable(e) if e.contains("can't start"))
@@ -868,36 +803,6 @@ mod tests {
         r.driver().fail = None;
         r.poll(5, 500);
         assert_eq!(r.writes(), ["1\n"]);
-    }
-
-    #[test]
-    fn a_file_the_service_may_not_write_asks_the_loader_again() {
-        // Loaded by someone else: the file is still root-only until the loader prepares it.
-        let (r, calls) = rig_with_loader(true, |d, force| {
-            assert!(force);
-            d.fail = None;
-            Ok(())
-        });
-        r.driver().fail = Some(libc::EACCES);
-        assert!(matches!(r.monitor.read(), El2Reading::Counting(_)));
-        assert_eq!(*calls.lock().unwrap(), [true]);
-        assert_eq!(r.writes(), ["1\n"]);
-    }
-
-    #[test]
-    fn a_driver_load_does_not_hold_the_monitor() {
-        let (r, _) = rig_with_loader(false, |d, _| {
-            thread::sleep(Duration::from_millis(400));
-            d.exists = true;
-            Ok(())
-        });
-        let monitor = r.monitor.clone();
-        let loading = thread::spawn(move || monitor.read());
-        thread::sleep(Duration::from_millis(100));
-        let started = Instant::now();
-        r.monitor.stop_if_idle();
-        assert!(started.elapsed() < Duration::from_millis(200), "waited for the load");
-        assert!(matches!(loading.join().unwrap(), El2Reading::Counting(_)));
     }
 
     #[test]

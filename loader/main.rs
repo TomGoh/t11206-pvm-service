@@ -1,14 +1,15 @@
 // Copyright 2026 KylinSoft Co., Ltd.
 // SPDX-License-Identifier: Apache-2.0
 
-//! `xkernel_vm_loader`: loads the hypervisor's host driver when the control service asks.
+//! `xkernel_vm_loader`: loads or unloads the host driver for the VM lifecycle.
 //!
-//! init starts it (a oneshot service of the init script) whenever the service writes a request
-//! number to `xkernel_vm.load_driver`, i.e. on the first start of the VM after boot. It loads the
-//! modules of its directory in the order of `modules.load` (see `loader.rs`), waits for
-//! `/dev/xhyper`, makes it 0666 root root like AOSP's `/dev/kvm` (SELinux lets only the crosvm
-//! domain open it), and writes `loaded <request>` or `failed <request>: <reason>` to
-//! `xkernel_vm.driver_status`, `<request>` being the newest value of the request property.
+//! The existing init property trigger starts this oneshot on `xkernel_vm.load_driver=*`.
+//! It captures the request before acting: `load:<pid>.<sequence>` loads and prepares nodes,
+//! `unload:<pid>.<sequence>` removes modules in reverse `modules.load` order (see `loader.rs`).
+//! Legacy unprefixed requests still load. Results echo that exact request as `loaded <request>`,
+//! `unloaded <request>` or `failed <request>: <reason>` on `xkernel_vm.driver_status`.
+//! Unload uses only the existing module capability, module-directory existence and data-node
+//! attributes; it never inspects module reference counts or reads a global module listing.
 //!
 //! Before reporting, it also makes the driver's EL2 cycle counter file, `/proc/xcore_stats`,
 //! 0660 root system, so that the control service (uid system, no capabilities) can start, read
@@ -21,7 +22,10 @@
 
 mod loader;
 
-use loader::{clip, load_all, parse_list, Kernel, LOAD_PROPERTY, STATUS_PROPERTY};
+use loader::{
+    clip, load_all, operation, parse_list, unload_all, Kernel, Operation, LOAD_PROPERTY,
+    STATUS_PROPERTY,
+};
 use log::{error, info, warn, LevelFilter};
 use rustutils::system_properties;
 use std::ffi::CString;
@@ -73,6 +77,23 @@ impl Kernel for System {
         }
     }
 
+    fn unload(&self, name: &str) -> io::Result<()> {
+        let name = CString::new(name).map_err(|_| io::Error::from_raw_os_error(libc::EINVAL))?;
+        // SAFETY: delete_module reads the NUL-terminated name; O_NONBLOCK forbids waiting for references.
+        let result =
+            unsafe { libc::syscall(libc::SYS_delete_module, name.as_ptr(), libc::O_NONBLOCK) };
+        if result == 0 {
+            Ok(())
+        } else {
+            Err(io::Error::last_os_error())
+        }
+    }
+
+    fn monitor_exists(&self) -> bool {
+        // getattr is already allowed for the counter file; no file contents are opened.
+        std::fs::symlink_metadata(MONITOR_FILE).is_ok()
+    }
+
     fn node_exists(&self) -> bool {
         let Ok(path) = c_path(&self.device) else { return false };
         // SAFETY: access only reads the NUL-terminated path.
@@ -115,10 +136,15 @@ fn prepare_monitor() -> io::Result<bool> {
     Ok(true)
 }
 
-fn run(dir: &Path, device: PathBuf) -> Result<Vec<String>, String> {
+fn run(dir: &Path, device: PathBuf, operation: Operation) -> Result<Vec<String>, String> {
     let list = dir.join("modules.load");
     let text = std::fs::read_to_string(&list).map_err(|e| format!("{}: {e}", list.display()))?;
-    let loaded = load_all(dir, &parse_list(&text)?, &System { device }, NODE_TIMEOUT)?;
+    let modules = parse_list(&text)?;
+    let kernel = System { device };
+    if operation == Operation::Unload {
+        return unload_all(&modules, &kernel);
+    }
+    let loaded = load_all(dir, &modules, &kernel, NODE_TIMEOUT)?;
     match prepare_monitor() {
         Ok(true) => info!("{MONITOR_FILE} made 0660 root system"),
         Ok(false) => info!("the driver offers no {MONITOR_FILE}"),
@@ -136,16 +162,17 @@ fn main() -> ExitCode {
     let mut args = std::env::args_os().skip(1);
     let dir = args.next().map(PathBuf::from).unwrap_or_else(|| PathBuf::from(DEFAULT_DIR));
     let device = args.next().map(PathBuf::from).unwrap_or_else(|| PathBuf::from(DEFAULT_DEVICE));
-    let result = run(&dir, device);
-    // Answer the newest request: one written while this ran is served by this load too.
     let request = system_properties::read(LOAD_PROPERTY).ok().flatten().unwrap_or_default();
+    let op = operation(&request);
+    let result = op.as_ref().map_err(Clone::clone).and_then(|op| run(&dir, device, *op));
     let (status, code) = match &result {
         Ok(loaded) => {
-            info!("hypervisor driver ready (loaded {loaded:?} from {})", dir.display());
-            (format!("loaded {request}"), ExitCode::SUCCESS)
+            let verb = if op == Ok(Operation::Unload) { "unloaded" } else { "loaded" };
+            info!("hypervisor driver {verb} ({loaded:?} from {})", dir.display());
+            (format!("{verb} {request}"), ExitCode::SUCCESS)
         }
         Err(reason) => {
-            error!("hypervisor driver not loaded: {reason}");
+            error!("hypervisor driver operation failed: {reason}");
             (format!("failed {request}: {reason}"), ExitCode::FAILURE)
         }
     };
